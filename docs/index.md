@@ -20,17 +20,38 @@ hero:
 
 features:
   - title: 🤖 6 Capability Surfaces
-    details: LLM (Qwen / Llama / Phi / Mistral / ChatGLM / Gemma / 40+ via mistralrs) · TTS (VoxCpm) · ASR (Whisper) · Rerank (BGE / mxbai / jina / Cohere) · Embedding (MiniLM BERT) · Vision (YOLOv8 / RT-DETR / DETR / RF-DETR / Florence-2 / Grounding DINO)
+    details: |
+      LLM (Qwen / Llama / Phi / Mistral / ChatGLM / Gemma / 40+ via mistralrs) ·
+      TTS (VoxCpm) · ASR (Whisper) · Rerank (BGE / mxbai / jina / Cohere) ·
+      Embedding (MiniLM BERT) · Vision (YOLOv8 / RT-DETR / DETR / RF-DETR /
+      Florence-2 / Grounding DINO)
   - title: 🔌 OpenAI + Anthropic Wire-Format
-    details: 10+ OpenAI-compatible routes (`/v1/chat/completions`, `/v1/audio/speech`, `/v1/embeddings`, `/v1/rerank`, `/v1/vision/*`, `/v1/models/pull`, ...) + `/v1/messages` for Anthropic Messages v1 (vision, tool_use, cache_control, extended thinking, streaming SSE).
+    details: |
+      10+ OpenAI-compatible routes (/v1/chat/completions, /v1/audio/speech,
+      /v1/embeddings, /v1/rerank, /v1/vision/*, /v1/models/pull, …) +
+      /v1/messages for Anthropic Messages v1 (vision, tool_use, cache_control,
+      extended thinking, streaming SSE).
   - title: 🛠 3 ML Frameworks, Pick What Fits
-    details: candle (default, LLM/ASR/Rerank/Embedding/Vision) · burn (TTS via VoxCpm) · litert_lm (on-device LLM via subprocess). Feature flags let you opt in to just the engines you need.
+    details: |
+      candle (default, LLM/ASR/Rerank/Embedding/Vision) · burn (TTS via VoxCpm) ·
+      litert_lm (on-device LLM via subprocess). Feature flags let you opt in to
+      just the engines you need.
   - title: 📦 Library-Only, Embedded
-    details: No standalone daemon. Hosts call `neure::run_embedded(NeureEmbedConfig { port: 8085, ... })` and get back a `NeureHandle` that owns the axum server lifetime. Drop neure into Tauri 2 / Flutter (via cargo-ndk) / server-side process / any Rust binary.
+    details: |
+      No standalone daemon. Hosts call neure::run_embedded(...) and get back a
+      NeureHandle that owns the axum server lifetime. Drop neure into Tauri 2 /
+      Flutter (via cargo-ndk) / server-side process / any Rust binary.
   - title: 🌍 Multi-Source Model Registry
-    details: Plug-in sources for HuggingFace, hf-mirror (China CDN), ModelScope. Per-engine and per-model source overrides. `<source>:<repo>` syntax in `POST /v1/models/pull` with default-source fallback. Catalog dedup across sources.
+    details: |
+      Plug-in sources for HuggingFace, hf-mirror (China CDN), ModelScope.
+      Per-engine and per-model source overrides. <source>:<repo> syntax in
+      POST /v1/models/pull with default-source fallback. Catalog dedup
+      across sources.
   - title: 📜 Apache-2.0
-    details: Released under the Apache License 2.0. In-house VoxCpm vendored under `src/tts/voxcpm_burn/` and clean-room YOLOv8 architecture in `src/vision/yolov8_arch.rs`. No AGPL-3.0, no copyleft.
+    details: |
+      Released under the Apache License 2.0. In-house VoxCpm vendored under
+      src/tts/voxcpm_burn/ and clean-room YOLOv8 architecture in
+      src/vision/yolov8_arch.rs. No AGPL-3.0, no copyleft.
 
 ---
 

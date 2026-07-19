@@ -9,6 +9,13 @@ export default defineConfig({
   appearance: 'dark',
   ignoreDeadLinks: true,
 
+  // Exclude internal-only design specs from the public site. The
+  // docs/superpowers/ directory is git-ignored (per project policy) but
+  // VitePress still walks docs/ for markdown to compile, so we have to
+  // tell it to skip superpowers/ explicitly. See root /AGENTS.md and
+  // shadow/AGENTS.md for the design-spec version-control rationale.
+  srcExclude: ['**/superpowers/**'],
+
   head: [
     ['meta', { name: 'theme-color', content: '#1f6feb' }],
     ['meta', { property: 'og:title', content: 'neure — Neural Inference Runtime' }],

@@ -69,23 +69,15 @@ jobs:
 
       - name: Install dependencies
         working-directory: docs
-        # Use `npm ci` if a lockfile is checked in; fall back to `npm install`
-        # on first build (when no lockfile yet exists).
-        run: |
-          if [ -f package-lock.json ]; then
-            echo "Using npm ci (lockfile present)"
-            npm ci --no-audit --no-fund
-          else
-            echo "No package-lock.json — using npm install (first build)"
-            npm install --no-audit --no-fund
-          fi
+        # Use `npm ci` for fast, reproducible installs. Requires
+        # docs/package-lock.json to be checked in (it is). The
+        # `cache-dependency-path: 'docs/package-lock.json'` directive
+        # on actions/setup-node above keys the npm cache on this file.
+        run: npm ci --no-audit --no-fund
 
       - name: Build VitePress site
         working-directory: docs
-        run: |
-          set -euo pipefail
-          npx vitepress build \
-            --logLevel info
+        run: npx vitepress build --logLevel info
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
