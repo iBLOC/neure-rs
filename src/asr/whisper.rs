@@ -1,0 +1,610 @@
+//! Real Candle-backed ASR runtime for OpenAI Whisper.
+//!
+//! Whisper (https://huggingface.co/openai/whisper-base) is OpenAI's multilingual
+//! speech recognition model. Supports transcription and translation.
+//!
+//! Enable with: `NEURE_ASR_RUNTIME=candle` and set `NEURE_ASR_MODEL_PATH` to a
+//! directory containing config.json + tokenizer.json + preprocessor_config.json + *.safetensors.
+//!
+//! Also requires `mel_filters.npz` or `mel_filters.safetensors` in the model directory
+//! (download from https://huggingface.co/spaces/lmz/candle-whisper/resolve/main/mel_filters.safetensors).
+
+use std::path::PathBuf;
+use std::sync::Mutex;
+
+use async_trait::async_trait;
+use candle_core::{Device, DType, IndexOp, Tensor};
+use candle_nn::VarBuilder;
+use candle_transformers::models::whisper::{self as m, audio, Config};
+use tokenizers::Tokenizer;
+
+use crate::config::{ensure_dir, DeviceSelection};
+use crate::llm::{ChatResult, NeureError};
+
+use super::{AsrRuntime, Transcription};
+
+const MAX_TOKENS: usize = 200;
+const SOT_TOKEN: u32 = 50258;
+const TRANSCRIBE_TOKEN: u32 = 50359;
+const EOT_TOKEN: u32 = 50257;
+const NO_TIMESTAMPS_TOKEN: u32 = 50363;
+const N_MELS: usize = 80;
+
+pub struct WhisperAsrRuntime {
+    inner: Mutex<Option<LoadedWhisper>>,
+}
+
+struct LoadedWhisper {
+    model: m::model::Whisper,
+    tokenizer: Tokenizer,
+    config: Config,
+    mel_filters: Vec<f32>,
+    device: Device,
+}
+
+fn decode_wav(data: &[u8]) -> Result<(Vec<f32>, u32), String> {
+    if data.len() < 44 || &data[0..4] != b"RIFF" || &data[8..12] != b"WAVE" {
+        return Err("not a valid WAV file".to_string());
+    }
+    let mut pos = 12;
+    let mut sample_rate = 0u32;
+    let mut num_channels = 0u16;
+    let mut bits_per_sample = 0u16;
+    let mut audio_data_pos = 0;
+    let mut audio_data_len = 0;
+    while pos + 8 <= data.len() {
+        let chunk_id = &data[pos..pos + 4];
+        let chunk_size = u32::from_le_bytes([data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7]]);
+        if chunk_id == b"fmt " {
+            num_channels = u16::from_le_bytes([data[pos + 10], data[pos + 11]]);
+            sample_rate = u32::from_le_bytes([data[pos + 12], data[pos + 13], data[pos + 14], data[pos + 15]]);
+            bits_per_sample = u16::from_le_bytes([data[pos + 22], data[pos + 23]]);
+        } else if chunk_id == b"data" {
+            audio_data_pos = pos + 8;
+            audio_data_len = chunk_size as usize;
+            break;
+        }
+        pos += 8 + chunk_size as usize;
+    }
+    if audio_data_pos == 0 {
+        return Err("no audio data chunk found".to_string());
+    }
+    if sample_rate != 16000 {
+        return Err(format!("unsupported sample rate {} (expected 16000)", sample_rate));
+    }
+    if bits_per_sample != 16 {
+        return Err(format!("unsupported bits per sample {} (only 16-bit supported)", bits_per_sample));
+    }
+    let mut samples = Vec::with_capacity(audio_data_len / 2);
+    for i in (0..audio_data_len).step_by(2) {
+        let s = i16::from_le_bytes([data[audio_data_pos + i], data[audio_data_pos + i + 1]]);
+        samples.push(s as f32 / 32768.0);
+    }
+    if num_channels == 2 {
+        let mut mono = Vec::with_capacity(samples.len() / 2);
+        for i in (0..samples.len()).step_by(2) {
+            mono.push((samples[i] + samples[i + 1]) / 2.0);
+        }
+        samples = mono;
+    }
+    Ok((samples, sample_rate))
+}
+
+impl WhisperAsrRuntime {
+    pub fn new() -> Self {
+        Self {
+            inner: Mutex::new(None),
+        }
+    }
+
+    fn resolve_model_path(model: &str) -> Result<PathBuf, String> {
+        let path = match std::env::var("NEURE_ASR_MODEL_PATH") {
+            Ok(p) => PathBuf::from(p),
+            Err(_) => {
+                return Err(format!(
+                    "WhisperAsrRuntime: set NEURE_ASR_MODEL_PATH to a directory containing \
+                     config.json + tokenizer.json + *.safetensors + mel_filters.safetensors \
+                     for Whisper model '{}' (e.g. openai/whisper-tiny). \
+                     Download mel_filters from: \
+                     https://huggingface.co/spaces/lmz/candle-whisper/resolve/main/mel_filters.safetensors",
+                    model
+                ));
+            }
+        };
+        ensure_dir(&path, "NEURE_ASR_MODEL_PATH")?;
+        let config_path = path.join("config.json");
+        let tokenizer_path = path.join("tokenizer.json");
+        let has_weights = std::fs::read_dir(&path)
+            .map(|entries| {
+                entries.filter_map(|e| e.ok()).any(|e| {
+                    e.path()
+                        .extension()
+                        .map(|ext| ext == "safetensors")
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false);
+        let has_mel_filters = path.join("mel_filters.safetensors").exists()
+            || path.join("mel_filters.npz").exists();
+
+        if !config_path.exists() {
+            return Err(format!("config.json not found in {}", path.display()));
+        }
+        if !tokenizer_path.exists() {
+            return Err(format!(
+                "tokenizer.json not found in {}",
+                path.display()
+            ));
+        }
+        if !has_weights {
+            return Err(format!(
+                "No .safetensors files found in {}",
+                path.display()
+            ));
+        }
+        if !has_mel_filters {
+            return Err(format!(
+                "mel_filters.safetensors not found in {}. Download from: \
+                 https://huggingface.co/spaces/lmz/candle-whisper/resolve/main/mel_filters.safetensors",
+                path.display()
+            ));
+        }
+        Ok(path)
+    }
+
+    fn map_device(device: &DeviceSelection) -> Result<Device, String> {
+        match device {
+            DeviceSelection::Cpu => Ok(Device::Cpu),
+            DeviceSelection::Nvidia => {
+                #[cfg(feature = "cuda")]
+                {
+                    Device::new_cuda(0).map_err(|e| format!("cuda: {}", e))
+                }
+                #[cfg(not(feature = "cuda"))]
+                {
+                    Err("CUDA not enabled. Rebuild with --features cuda".to_string())
+                }
+            }
+            DeviceSelection::Apple => {
+                #[cfg(feature = "metal")]
+                {
+                    Device::new_metal(0).map_err(|e| format!("metal: {}", e))
+                }
+                #[cfg(not(feature = "metal"))]
+                {
+                    Err("Metal not enabled. Rebuild with --features metal".to_string())
+                }
+            }
+            DeviceSelection::Auto | DeviceSelection::Vulkan => Ok(Device::Cpu),
+        }
+    }
+
+    fn load_mel_filters(path: &PathBuf, num_mel_bins: usize) -> Result<Vec<f32>, String> {
+        let safetensors_path = path.join("mel_filters.safetensors");
+        if safetensors_path.exists() {
+            return Self::load_mel_safetensors(&safetensors_path, num_mel_bins);
+        }
+        let npz_path = path.join("mel_filters.npz");
+        if npz_path.exists() {
+            return Self::load_mel_npz(&npz_path, num_mel_bins);
+        }
+        Err("mel_filters file not found".to_string())
+    }
+
+    fn load_mel_safetensors(path: &PathBuf, num_mel_bins: usize) -> Result<Vec<f32>, String> {
+        use std::fs::File;
+        use std::io::Read;
+        let mut file = File::open(path).map_err(|e| format!("open mel_filters: {}", e))?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).map_err(|e| format!("read mel_filters: {}", e))?;
+        if bytes.len() < 8 {
+            return Err("mel_filters safetensors file too short".to_string());
+        }
+        let magic = &bytes[0..8];
+        if magic != b"ET\x00\x00" {
+            return Err("not a valid safetensors file".to_string());
+        }
+        let n = bytes.len();
+        let expected = num_mel_bins * N_MELS * 4;
+        if n - 8 < expected {
+            return Err(format!(
+                "mel_filters size {} doesn't match expected {} (num_mel_bins={})",
+                n - 8, expected, num_mel_bins
+            ));
+        }
+        let mut filters = vec![0f32; num_mel_bins * N_MELS];
+        for i in 0..filters.len() {
+            let offset = 8 + i * 4;
+            filters[i] = f32::from_le_bytes([bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3]]);
+        }
+        Ok(filters)
+    }
+
+    fn load_mel_npz(path: &PathBuf, num_mel_bins: usize) -> Result<Vec<f32>, String> {
+        use std::fs::File;
+        use std::io::Read;
+        let mut file = File::open(path).map_err(|e| format!("open mel_filters.npz: {}", e))?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).map_err(|e| format!("read mel_filters.npz: {}", e))?;
+        let mut pos = 0;
+        while pos + 115 <= bytes.len() {
+            let sig = &bytes[pos..pos + 4];
+            if sig != b"PK\x03\x04" {
+                break;
+            }
+            let name_len = u16::from_le_bytes([bytes[pos + 28], bytes[pos + 29]]) as usize;
+            let data_len = u32::from_le_bytes([bytes[pos + 32], bytes[pos + 33], bytes[pos + 34], bytes[pos + 35]]) as usize;
+            let header_pos = pos + 30 + name_len;
+            let data_pos = (header_pos + (header_pos % 2)) as usize;
+            if data_pos + data_len > bytes.len() {
+                break;
+            }
+            let name_bytes = &bytes[pos + 30..pos + 30 + name_len];
+            if name_bytes.ends_with(b"mel") || name_bytes.ends_with(b"fbank_matrix") || name_bytes.ends_with(b"/mel") {
+                let expected = num_mel_bins * N_MELS * 4;
+                if data_len != expected {
+                    return Err(format!(
+                        "mel_filters.npz array size {} doesn't match expected {}",
+                        data_len, expected
+                    ));
+                }
+                let mut filters = vec![0f32; num_mel_bins * N_MELS];
+                for i in 0..filters.len() {
+                    let offset = data_pos + i * 4;
+                    filters[i] = f32::from_le_bytes([bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3]]);
+                }
+                return Ok(filters);
+            }
+            pos = data_pos + data_len;
+            pos += pos % 2;
+        }
+        Err("mel_filters.npz does not contain mel array".to_string())
+    }
+}
+
+impl Default for WhisperAsrRuntime {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl AsrRuntime for WhisperAsrRuntime {
+    async fn load(model: &str, device: &DeviceSelection) -> ChatResult<Box<dyn AsrRuntime>>
+    where
+        Self: Sized,
+    {
+        let path = Self::resolve_model_path(model).map_err(NeureError::not_implemented)?;
+        let dev = Self::map_device(device).map_err(NeureError::not_implemented)?;
+
+        let config_path = path.join("config.json");
+        let config_data = std::fs::read_to_string(&config_path)
+            .map_err(|e| NeureError::not_implemented(format!("read config.json: {}", e)))?;
+        let config: Config = serde_json::from_str(&config_data)
+            .map_err(|e| NeureError::not_implemented(format!("parse config.json: {}", e)))?;
+
+        let tokenizer_path = path.join("tokenizer.json");
+        let tokenizer = Tokenizer::from_file(&tokenizer_path)
+            .map_err(|e| NeureError::not_implemented(format!("load tokenizer: {}", e)))?;
+
+        let mel_filters = Self::load_mel_filters(&path, config.num_mel_bins)
+            .map_err(|e| NeureError::not_implemented(format!("load mel_filters: {}", e)))?;
+
+        let safetensors_files: Vec<PathBuf> = std::fs::read_dir(&path)
+            .map_err(|e| NeureError::not_implemented(format!("read dir: {}", e)))?
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.path()
+                    .extension()
+                    .map(|ext| ext == "safetensors")
+                    .unwrap_or(false)
+            })
+            .map(|e| e.path())
+            .collect();
+
+        if safetensors_files.is_empty() {
+            return Err(NeureError::not_implemented(
+                "No safetensors files found".to_string(),
+            ));
+        }
+
+        let safetensors_paths: Vec<&std::path::Path> =
+            safetensors_files.iter().map(|p| p.as_path()).collect();
+
+        let vb = unsafe {
+            VarBuilder::from_mmaped_safetensors(safetensors_paths.as_slice(), DType::F32, &dev)
+        }
+        .map_err(|e| NeureError::not_implemented(format!("load safetensors: {}", e)))?;
+
+        let model = m::model::Whisper::load(&vb, config.clone())
+            .map_err(|e| NeureError::not_implemented(format!("build Whisper model: {}", e)))?;
+
+        let loaded = LoadedWhisper {
+            model,
+            tokenizer,
+            config,
+            mel_filters,
+            device: dev,
+        };
+
+        let runtime = WhisperAsrRuntime::new();
+        *runtime.inner.lock().unwrap() = Some(loaded);
+
+        Ok(Box::new(runtime))
+    }
+
+    async fn transcribe(&self, audio: &[u8], _lang: Option<&str>) -> ChatResult<Transcription> {
+        if audio.is_empty() {
+            return Err(NeureError::invalid_input("empty audio"));
+        }
+        let looks_like_wav =
+            audio.len() >= 12 && &audio[0..4] == b"RIFF" && &audio[8..12] == b"WAVE";
+        if !looks_like_wav {
+            return Err(NeureError::invalid_input(
+                "audio does not look like WAV (missing RIFF/WAVE header)",
+            ));
+        }
+
+        let (mut model, tokenizer, config, mel_filters, device) = {
+            let inner = self.inner.lock().unwrap();
+            let loaded = inner.as_ref().ok_or_else(|| {
+                NeureError::not_initialized(
+                    "WhisperAsrRuntime not loaded. Call load() first or check that \
+                     NEURE_ASR_RUNTIME=candle and NEURE_ASR_MODEL_PATH is valid."
+                        .to_string(),
+                )
+            })?;
+            (loaded.model.clone(), loaded.tokenizer.clone(), loaded.config.clone(), loaded.mel_filters.clone(), loaded.device.clone())
+        };
+
+        let (pcm_data, _sample_rate) = decode_wav(audio)
+            .map_err(|e| NeureError::invalid_input(format!("WAV decode: {}", e)))?;
+
+        let mel_data = audio::pcm_to_mel(&config, &pcm_data, &mel_filters);
+        let mel_len = mel_data.len();
+        let mel = Tensor::from_vec(
+            mel_data,
+            (1, config.num_mel_bins, mel_len / config.num_mel_bins),
+            &device,
+        )
+        .map_err(|e| NeureError::not_implemented(format!("mel tensor: {}", e)))?;
+
+        let audio_features = model
+            .encoder
+            .forward(&mel, true)
+            .map_err(|e| NeureError::not_implemented(format!("encoder: {}", e)))?;
+
+        let sot_token = tokenizer
+            .token_to_id("<|startoftranscript|>")
+            .unwrap_or(SOT_TOKEN);
+        let transcribe_token = tokenizer
+            .token_to_id("<|transcribe|>")
+            .unwrap_or(TRANSCRIBE_TOKEN);
+        let no_timestamps_token = tokenizer
+            .token_to_id("<|notimestamps|>")
+            .unwrap_or(NO_TIMESTAMPS_TOKEN);
+        let eot_token = tokenizer
+            .token_to_id("<|endoftext|>")
+            .unwrap_or(EOT_TOKEN);
+
+        let mut tokens: Vec<u32> = vec![sot_token, transcribe_token, no_timestamps_token];
+
+        for _ in 0..MAX_TOKENS {
+            let tokens_t = Tensor::new(tokens.as_slice(), &device)
+                .map_err(|e| NeureError::not_implemented(format!("tokens tensor: {}", e)))?;
+            let tokens_t = tokens_t
+                .unsqueeze(0)
+                .map_err(|e| NeureError::not_implemented(format!("unsqueeze: {}", e)))?;
+
+            let ys = model
+                .decoder
+                .forward(&tokens_t, &audio_features, tokens.len() == 3)
+                .map_err(|e| NeureError::not_implemented(format!("decoder: {}", e)))?;
+
+            let seq_len = ys.dim(1).map_err(|e| NeureError::not_implemented(format!("dim: {}", e)))?;
+            let last_hidden = ys.i((.., seq_len - 1..)).map_err(|e| NeureError::not_implemented(format!("index: {}", e)))?;
+            let logits = model
+                .decoder
+                .final_linear(&last_hidden)
+                .map_err(|e| NeureError::not_implemented(format!("final_linear: {}", e)))?;
+            let logits = logits
+                .squeeze(0)
+                .map_err(|e| NeureError::not_implemented(format!("squeeze: {}", e)))?;
+            let logits = logits
+                .squeeze(0)
+                .map_err(|e| NeureError::not_implemented(format!("squeeze2: {}", e)))?;
+
+            let next_token = logits
+                .argmax(candle_core::D::Minus1)
+                .map_err(|e| NeureError::not_implemented(format!("argmax: {}", e)))?
+                .to_scalar::<u32>()
+                .map_err(|e| NeureError::not_implemented(format!("to_scalar: {}", e)))?;
+
+            tokens.push(next_token);
+
+            if next_token == eot_token {
+                break;
+            }
+        }
+
+        let text = tokenizer
+            .decode(&tokens, true)
+            .map_err(|e| NeureError::not_implemented(format!("decode: {}", e)))?;
+
+        Ok(Transcription {
+            text,
+            language: None,
+            duration_secs: Some(pcm_data.len() as f32 / 16000.0),
+        })
+    }
+
+    fn name(&self) -> &str {
+        "whisper"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[serial_test::serial]
+    fn test_resolve_model_path_without_env_returns_useful_error() {
+        unsafe { std::env::remove_var("NEURE_ASR_MODEL_PATH") };
+        let result = WhisperAsrRuntime::resolve_model_path("whisper-base");
+        assert!(result.is_err());
+        let err = result.err().unwrap();
+        assert!(
+            err.contains("NEURE_ASR_MODEL_PATH"),
+            "Error should mention NEURE_ASR_MODEL_PATH, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_resolve_model_path_with_valid_env_path_returns_ok() {
+        let dir = std::env::temp_dir().join(format!(
+            "neure-whisper-resolve-ok-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        std::fs::write(dir.join("config.json"), b"{}").expect("write config");
+        std::fs::write(dir.join("tokenizer.json"), b"{}").expect("write tokenizer");
+        std::fs::write(dir.join("model.safetensors"), b"fake").expect("write weights");
+        std::fs::write(dir.join("mel_filters.safetensors"), b"fake").expect("write mel");
+        unsafe { std::env::set_var("NEURE_ASR_MODEL_PATH", &dir) };
+
+        let result = WhisperAsrRuntime::resolve_model_path("whisper-base");
+        let _ = std::fs::remove_dir_all(&dir);
+        unsafe { std::env::remove_var("NEURE_ASR_MODEL_PATH") };
+
+        assert!(result.is_ok(), "expected Ok, got: {result:?}");
+        assert_eq!(result.unwrap(), dir);
+    }
+
+    #[test]
+    fn test_whisper_name() {
+        let runtime = WhisperAsrRuntime::new();
+        assert_eq!(runtime.name(), "whisper");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_whisper_load_without_path_returns_useful_error() {
+        unsafe { std::env::remove_var("NEURE_ASR_MODEL_PATH") };
+        let result = WhisperAsrRuntime::load("whisper-base", &DeviceSelection::Cpu).await;
+        assert!(result.is_err());
+        let err = result.err().unwrap();
+        assert!(err.message.contains("NEURE_ASR_MODEL_PATH"));
+    }
+
+    #[tokio::test]
+    async fn test_whisper_transcribe_not_loaded_returns_error() {
+        let runtime = WhisperAsrRuntime::new();
+        let wav = b"RIFF\x00\x00\x00\x00WAVEfmt ".to_vec();
+        let result = runtime.transcribe(&wav, Some("en")).await;
+        assert!(result.is_err());
+        let err = result.err().unwrap();
+        assert_eq!(err.error_type, "not_initialized");
+    }
+
+    #[tokio::test]
+    async fn test_whisper_transcribe_empty_audio_rejected() {
+        let runtime = WhisperAsrRuntime::new();
+        let result = runtime.transcribe(&[], None).await;
+        assert!(result.is_err());
+        let err = result.err().unwrap();
+        assert!(err.message.contains("empty"));
+    }
+
+    #[test]
+    fn test_decode_wav_16bit_mono_16khz() {
+        let sample_rate = 16000u32;
+        let num_samples = sample_rate as usize;
+        let mut data = Vec::new();
+        data.extend_from_slice(b"RIFF");
+        data.extend_from_slice(&((36 + num_samples * 2) as u32).to_le_bytes());
+        data.extend_from_slice(b"WAVE");
+        data.extend_from_slice(b"fmt ");
+        data.extend_from_slice(&16u32.to_le_bytes());
+        data.extend_from_slice(&1u16.to_le_bytes());
+        data.extend_from_slice(&1u16.to_le_bytes());
+        data.extend_from_slice(&sample_rate.to_le_bytes());
+        data.extend_from_slice(&(sample_rate * 2).to_le_bytes());
+        data.extend_from_slice(&2u16.to_le_bytes());
+        data.extend_from_slice(&16u16.to_le_bytes());
+        data.extend_from_slice(b"data");
+        data.extend_from_slice(&((num_samples * 2) as u32).to_le_bytes());
+        for _ in 0..num_samples {
+            data.extend_from_slice(&0i16.to_le_bytes());
+        }
+
+        let (samples, sr) = decode_wav(&data).unwrap();
+        assert_eq!(samples.len(), num_samples);
+        assert_eq!(sr, 16000);
+    }
+
+    #[test]
+    fn test_decode_wav_rejects_wrong_sample_rate() {
+        let sample_rate = 8000u32;
+        let num_samples = 100usize;
+        let mut data = Vec::new();
+        data.extend_from_slice(b"RIFF");
+        data.extend_from_slice(&((36 + num_samples * 2) as u32).to_le_bytes());
+        data.extend_from_slice(b"WAVE");
+        data.extend_from_slice(b"fmt ");
+        data.extend_from_slice(&16u32.to_le_bytes());
+        data.extend_from_slice(&1u16.to_le_bytes());
+        data.extend_from_slice(&1u16.to_le_bytes());
+        data.extend_from_slice(&sample_rate.to_le_bytes());
+        data.extend_from_slice(&(sample_rate * 2).to_le_bytes());
+        data.extend_from_slice(&2u16.to_le_bytes());
+        data.extend_from_slice(&16u16.to_le_bytes());
+        data.extend_from_slice(b"data");
+        data.extend_from_slice(&((num_samples * 2) as u32).to_le_bytes());
+        for _ in 0..num_samples {
+            data.extend_from_slice(&0i16.to_le_bytes());
+        }
+
+        let result = decode_wav(&data);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("sample rate"));
+    }
+
+    #[test]
+    fn test_decode_wav_rejects_invalid_header() {
+        let data = b"NOT A WAV FILE";
+        let result = decode_wav(data);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_decode_wav_stereo_downmixes_to_mono() {
+        let sample_rate = 16000u32;
+        let num_frames = (sample_rate / 2) as usize;
+        let mut data = Vec::new();
+        data.extend_from_slice(b"RIFF");
+        data.extend_from_slice(&((36 + num_frames * 2 * 2) as u32).to_le_bytes());
+        data.extend_from_slice(b"WAVE");
+        data.extend_from_slice(b"fmt ");
+        data.extend_from_slice(&16u32.to_le_bytes());
+        data.extend_from_slice(&1u16.to_le_bytes());
+        data.extend_from_slice(&2u16.to_le_bytes());
+        data.extend_from_slice(&sample_rate.to_le_bytes());
+        data.extend_from_slice(&(sample_rate * 4).to_le_bytes());
+        data.extend_from_slice(&4u16.to_le_bytes());
+        data.extend_from_slice(&16u16.to_le_bytes());
+        data.extend_from_slice(b"data");
+        data.extend_from_slice(&((num_frames * 2 * 2) as u32).to_le_bytes());
+        for _ in 0..num_frames {
+            data.extend_from_slice(&16384i16.to_le_bytes());
+            data.extend_from_slice(&(-16384i16).to_le_bytes());
+        }
+
+        let (samples, sr) = decode_wav(&data).unwrap();
+        assert_eq!(samples.len(), num_frames);
+        assert_eq!(sr, 16000);
+        assert!((samples[0] - 0.0).abs() < 1e-6);
+    }
+}

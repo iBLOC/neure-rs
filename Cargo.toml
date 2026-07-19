@@ -1,0 +1,79 @@
+[package]
+name = "neure"
+version = "0.1.0"
+edition = "2024"
+description = "Neure - Neural Inference Runtime (LLM/TTS/ASR/Rerank/Embedding/Vision) — OpenAI- and Anthropic-compatible inference engine for embedding into Rust hosts"
+authors = ["Neure Team"]
+license = "Apache-2.0"
+repository = "https://github.com/ibloc/neure"
+homepage = "https://github.com/ibloc/neure"
+keywords = ["rust", "inference", "openai", "llm", "tts", "asr", "rerank", "embedding", "vision"]
+categories = ["api-bindings", "command-line-utilities", "machine-learning"]
+
+[lib]
+name = "neure_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+reqwest = { version = "0.12", features = ["json", "multipart", "rustls-tls", "stream"], default-features = false }
+axum = { version = "0.8", features = ["ws", "multipart"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace", "cors"] }
+hyper = { version = "1.5", features = ["server", "http1", "http2"] }
+http-body-util = "0.1"
+futures-util = "0.3"
+bytes = "1"
+async-stream = "0.3"
+futures-channel = "0.3"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+fastrand = "2"
+
+candle-core = { git = "https://github.com/huggingface/candle.git", rev = "a9667ca", optional = true }
+candle-nn = { git = "https://github.com/huggingface/candle.git", rev = "a9667ca", optional = true }
+candle-transformers = { git = "https://github.com/huggingface/candle.git", rev = "a9667ca", optional = true }
+candle-flash-attn = { git = "https://github.com/huggingface/candle.git", rev = "a9667ca", optional = true }
+tokenizers = { version = "0.22", optional = true }
+litert-lm = { version = "0.1", optional = true }
+mistralrs = { git = "https://github.com/EricLBuehler/mistral.rs", rev = "v0.8.22", optional = true }
+
+burn = { version = "0.21", features = ["ndarray"], optional = true }
+burn-store = { version = "0.21", features = ["safetensors"], optional = true }
+hound = { version = "3.5", optional = true }
+symphonia = { version = "0.5", features = ["mp3", "flac", "vorbis", "pcm"], optional = true }
+rubato = { version = "3", optional = true }
+
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"], optional = true }
+base64 = { version = "0.22", optional = true }
+safetensors = { version = "0.4", optional = true }
+
+[dev-dependencies]
+tempfile = "3"
+tokio-test = "0.4"
+serial_test = "3"
+criterion = { version = "0.5", features = ["html_reports"] }
+tokio = { version = "1", features = ["full"] }
+
+[[bench]]
+name = "perf"
+harness = false
+
+[features]
+default = ["candle"]
+candle = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "dep:tokenizers", "dep:image", "dep:base64", "dep:safetensors"]
+flash-attn = ["candle-transformers/flash-attn", "dep:candle-flash-attn"]
+metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
+cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
+chronos2 = ["candle"]
+voxcpm = ["dep:burn", "dep:burn-store", "dep:hound"]
+litert = ["dep:litert-lm"]
+asr-audio = ["dep:symphonia", "dep:rubato"]
+mistralrs = ["dep:mistralrs", "candle"]
+
+

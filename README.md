@@ -1,0 +1,758 @@
+# neure
+
+A Rust inference engine for **LLM / TTS / ASR / Rerank / Embedding / Vision** that exposes a **standard OpenAI-compatible API** (plus Anthropic Messages v1 for chat). Designed as an in-process library that Rust hosts embed into their own process to serve the API — any host that wants OpenAI-compatible inference without standing up a separate daemon can use neure.
+
+> **neure** = neuron (神经元)
+>
+> Built with [candle](https://github.com/huggingface/candle) · inspired by [jhqxxx/aha](https://github.com/jhqxxx/aha) and [EricLBuehler/candle-vllm](https://github.com/EricLBuehler/candle-vllm)
+
+## Why neure exists
+
+neure is a single Rust crate that loads model weights, runs inference, and serves the result on OpenAI-compatible endpoints (`/v1/chat/completions`, `/v1/audio/speech`, `/v1/audio/transcriptions`, `/v1/embeddings`, `/v1/rerank`, `/v1/vision/*`, `/v1/messages`, …). The same wire format as OpenAI / vLLM / ollama / llama.cpp server means any compatible client can talk to neure without modification.
+
+## Embedded library usage
+
+neure only ships as a library. Hosts call `run_embedded()` to bind the
+OpenAI-compatible HTTP server on a port in their own process, get back a
+`NeureHandle`, and own the server's lifetime. This is the only supported
+deployment model — there is no standalone binary.
+
+```rust
+use neure::{run_embedded, NeureConfig, NeureEmbedConfig, NeureHandle, health};
+
+let handle: NeureHandle = run_embedded(NeureEmbedConfig {
+    port: 8085,  // embedded hosts typically override the 8083 default
+    config: NeureConfig::default(),
+}).await?;
+
+let h = health(&handle);
+assert_eq!(h.status, "ready");
+
+// On host shutdown:
+handle.request_shutdown();
+handle.join().await;
+```
+
+`NeureConfig` is the same struct embedded hosts use to point at model
+weights, pick a device, and set the default model per capability:
+
+```rust
+use neure::{NeureConfig, DeviceSelection};
+
+let config = NeureConfig::new()
+    .with_port(8085)
+    .with_device(DeviceSelection::Apple)
+    .with_llm_model("qwen3-0.6b")
+    .with_tts_model("voxcpm-0.5b")
+    .with_asr_model("whisper-base")
+    .with_rerank_model("bge-reranker-base")
+    .with_embedding_registration("all-minilm-l6-v2", "candle", DeviceSelection::Apple);
+```
+
+## HTTP surface
+
+| Endpoint | Method | Wire format | Purpose |
+|---|---|---|---|
+| `/v1/chat/completions` | POST | OpenAI Chat Completions | LLM chat (streaming + non-streaming) |
+| `/v1/messages` | POST | Anthropic Messages v1 | LLM chat (vision / tools / prompt caching / extended thinking) |
+| `/v1/audio/speech` | POST | OpenAI Audio | Text-to-speech |
+| `/v1/audio/transcriptions` | POST | OpenAI Audio | Speech-to-text (multipart) |
+| `/v1/rerank` | POST | OpenAI Rerank | Rerank documents by relevance to a query |
+| `/v1/embeddings` | POST | OpenAI Embeddings | Text embeddings (single string or batch) |
+| `/v1/vision/detect` | POST | neure (YOLO-shaped) | YOLOv8 / RT-DETR / DETR / Grounding DINO object detection (with optional LoRA-merged classes) |
+| `/v1/vision/classify` | POST | neure | Image classification (top-K class probabilities) |
+| `/v1/vision/segment` | POST | neure | Instance segmentation (per-pixel masks) |
+| `/v1/vision/pose` | POST | neure | Pose estimation (COCO 17-keypoint skeleton) |
+| `/v1/vision/lora/register` | POST | neure | Register a LoRA adapter for dynamic class extension |
+| `/v1/vision/lora/list` | GET | neure | List all registered LoRA adapters |
+| `/v1/vision/lora/{id}` | GET / DELETE | neure | Inspect / remove a LoRA adapter |
+| `/v1/models` | GET | neure | List loaded AND downloaded models across LLM/TTS/ASR/Rerank |
+| `/v1/models/{engine}/{id}` | GET | neure | Get details (size, files, compatible engines) for a downloaded model |
+| `/v1/models/pull` | POST | neure | Start an async download job (returns 202 + job_id) |
+| `/v1/models/pull/{job_id}` | GET | neure | Poll download job status |
+| `/v1/models/{engine}/{id}` | DELETE | neure | Delete a downloaded model from disk (returns 204) |
+| `/v1/info` | GET | neure | neure version, capabilities, model registry |
+| `/health` | GET | neure | Liveness probe |
+
+The OpenAI-compatible endpoints are **byte-for-byte OpenAI compatible** so Prefrontal, llama.cpp's `server`, vLLM, ollama, candle-vllm, and any other client can talk to neure without modification. The Anthropic-compatible `/v1/messages` endpoint speaks the [Anthropic Messages v1](https://docs.anthropic.com/en/api/messages) wire format (vision, tool_use, cache_control, extended thinking, streaming SSE), backed by the same engines as the OpenAI endpoint.
+
+**Example — non-streaming chat:**
+```bash
+curl -X POST http://localhost:8083/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "qwen3-0.6b",
+    "messages": [{"role":"user","content":"hi"}],
+    "max_tokens": 64,
+    "stop": ["\n\n"]
+  }'
+```
+
+**Example — streaming chat (one `data: {…}` event per token):**
+```bash
+curl -N -X POST http://localhost:8083/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "qwen3-0.6b",
+    "stream": true,
+    "messages": [{"role":"user","content":"hi"}],
+    "stop": ["\n\n", "END"]
+  }'
+# SSE: data: {"choices":[{"delta":{"role":"assistant"}},…]}
+#      data: {"choices":[{"delta":{"content":"Hello"}},…]}
+#      ...
+#      data: {"choices":[{"delta":{},"finish_reason":"stop"}]}
+#      data: [DONE]
+```
+
+**Example — Anthropic Messages v1 (`/v1/messages`):**
+```bash
+curl -X POST http://localhost:8083/v1/messages \
+  -H "Content-Type: application/json" \
+  -H "x-api-key: anything" \
+  -H "anthropic-version: 2023-06-01" \
+  -d '{
+    "model": "qwen3-0.6b",
+    "max_tokens": 256,
+    "messages": [{"role":"user","content":"hi"}]
+  }'
+# {"id":"msg_...","type":"message","role":"assistant",
+#  "content":[{"type":"text","text":"Hello"}],
+#  "model":"qwen3-0.6b","stop_reason":"end_turn",
+#  "usage":{"input_tokens":1,"output_tokens":1,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}
+```
+
+Streaming (`"stream": true`) returns Anthropic SSE: `event: message_start` / `event: content_block_start` / `event: content_block_delta` / `event: content_block_stop` / `event: message_delta` / `event: message_stop`, with Anthropic-shaped JSON payloads.
+
+
+### Model management (download / inspect / delete)
+
+In addition to the OpenAI-compatible inference endpoints, neure exposes 5 management endpoints for inspecting, downloading, and deleting models on disk. Models live under one or more `$NEURE_MODEL_DIRS` (colon-separated; default `~/.neure/models/`), organized as `{engine}/{id}/` per the convention each engine already understands. See the "Multiple model directories and source overrides" section below for full configuration.
+
+**Pull a model from HuggingFace:**
+```bash
+curl -X POST http://localhost:8083/v1/models/pull \
+  -H "Content-Type: application/json" \
+  -d '{"reference": "huggingface:Qwen/Qwen2.5-0.5B-Instruct", "engine": "llm", "id": "qwen2.5-0.5b"}'
+# {"engine":"llm","job_id":"<uuid>","reference":"...","status":"pending"}
+# HTTP 202 Accepted
+```
+
+**Poll progress:**
+```bash
+curl http://localhost:8083/v1/models/pull/<uuid>
+# {"job_id":"<uuid>","status":"in_progress","bytes_downloaded":524288000,"total_bytes":1024000000,...}
+```
+
+**List downloaded models:**
+```bash
+curl http://localhost:8083/v1/models | jq '.data[] | {id, capabilities}'
+```
+
+**Get details:**
+```bash
+curl http://localhost:8083/v1/models/llm/qwen2.5-0.5b | jq .
+# {"id":"llm/qwen2.5-0.5b","object":"model","engine":"llm","status":"downloaded","path":"...","size_bytes":1024000000,"file_count":3,"files":[...],"compatible_engines":["candle"]}
+```
+
+**Delete:**
+```bash
+curl -X DELETE http://localhost:8083/v1/models/llm/qwen2.5-0.5b
+# HTTP 204 No Content
+```
+
+**Sources (plugin architecture):** the `Source` trait (in `src/models/source.rs`) abstracts model providers. The default `HuggingFaceSource` shells out to `huggingface-cli` (must be installed). To add a new source (e.g., `ModelScopeSource`, custom S3/GCS bucket, or OCI registry), implement the `Source` trait in a new file under `src/models/` and register it in `SourceRegistry::with_defaults()`.
+
+**Requirements:**
+- `huggingface-cli` must be installed and on PATH (or set `NEURE_HUGGINGFACE_CLI` to its full path)
+- `NEURE_MODEL_DIRS` defaults to `~/.neure/models/` (single value; colon-separated for multiple)
+
+## Multiple model directories and source overrides
+
+neure scans one or more model roots and can route downloads to custom source mirrors per-engine or per-model. All of the following have an in-code builder equivalent on `NeureConfig`:
+
+```rust
+use neure::{NeureConfig, DeviceSelection, models::EngineType};
+
+let config = NeureConfig::new()
+    .with_model_dir("/opt/shared/models/")  // first dir wins on collision
+    .with_model_dir("/home/user/.neure/models/")
+    .with_default_source("huggingface")
+    .with_engine_source(EngineType::Llm, "modelscope")          // all LLMs from ModelScope
+    .with_model_source(EngineType::Llm, "qwen2.5-0.5b",         // this specific LLM from a private hub
+                         "private-hub")
+    .with_source_endpoint("huggingface", "https://hf-mirror.com"); // mirror for huggingface
+```
+
+Equivalent env vars (parsed by `NeureConfig::from_env`):
+
+| Env var | Maps to |
+|---|---|
+| `NEURE_MODEL_DIRS=/a:/b:/c` | `with_model_dir(...)` repeated |
+| `NEURE_MODEL_DIR=/single` | single-element `model_dirs` (legacy) |
+| `NEURE_DEFAULT_SOURCE=modelscope` | `with_default_source(...)` |
+| `NEURE_LLM_SOURCE=modelscope` | `with_engine_source(EngineType::Llm, ...)` |
+| `NEURE_MODEL_SOURCE_LLM_QWEN2_5_0_5B=private-hub` | `with_model_source(EngineType::Llm, "qwen2-5-0-5b", ...)` (underscores → hyphens) |
+| `NEURE_SOURCE_HUGGINGFACE_ENDPOINT=https://hf-mirror.com` | `with_source_endpoint("huggingface", ...)` (passed through to `huggingface-cli` via `HF_ENDPOINT`) |
+
+The `/v1/models` endpoint returns a `supported_count` and `available_count` so callers can distinguish "models neure knows how to run" from "models currently on disk":
+
+```json
+{
+  "object": "list",
+  "supported_count": 7,
+  "available_count": 2,
+  "data": [
+    { "id": "llm/qwen2.5-0.5b", "engine": "llm", "capabilities": ["chat"], ... },
+    { "id": "llm/llama-3-8b",   "engine": "llm", "capabilities": ["chat"], ... }
+  ]
+}
+```
+
+POST `/v1/models/pull` accepts an optional `source` field that takes precedence over both the reference-string prefix and the per-engine/per-model config: `{ "reference": "Qwen/X", "engine": "llm", "id": "x", "source": "modelscope" }`.
+- After pull, restart the server to load the new model (hot-swap is out of scope)
+
+## Supported Models
+
+| Model type | Engine | Default model | Architecture | Status | Notes |
+|---|---|---|---|---|---|
+| **LLM** | candle / litert / mistralrs | `qwen2.5-0.5b` (candle, 6-family support) / `gemma-3n-e2b-it` + `gemma-3n-e4b-it` + `gemma-3-12b-it` (litert) / any HF repo (mistralrs, 40+ families) | Qwen 2/2.5/3/3.5 + Llama 2/3 + Phi-3 + Mistral + ChatGLM (candle) / Gemma 3 (litert, via `lit` subprocess) / Qwen/Llama/Mistral/DeepSeek/GLM/Granite/GPT-OSS/Gemma 4/Qwen 3-VL/Phi 4 (mistralrs) | ✅ candle + litert + mistralrs all implemented | Apache-2.0 / MIT, [Qwen model card](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct), [litert_lm 0.1](https://github.com/maceip/litert-lm-rs) shells out to the `lit` binary for Gemma, [mistral.rs v0.8.22](https://github.com/EricLBuehler/mistral.rs) provides the multi-family dispatcher |
+| **TTS** | burn (VoxCpm) | — | VoxCPM (burn 0.21, vendored from voxcpm_rs) | ✅ burn implemented (requires `--features voxcpm`) | Chinese + English, voice cloning, [Model card](https://huggingface.co/openbmb/VoxCPM-0.5B), Apache-2.0 (in-house; voxcpm_rs is also Apache-2.0) |
+| **ASR** | candle (Whisper) | `whisper-base` (candle) | Whisper (candle-transformers) | ✅ candle implemented | WAV native; MP3 / FLAC / OGG-Vorbis via `--features asr-audio`. MIT, [Model card](https://huggingface.co/openai/whisper-base) |
+| **Rerank** | candle (bge / mxbai / jina) / cohere (API proxy) | `bge-reranker-base` (bge) / `mxbai-rerank-base-v2` (mxbai) / `jina-reranker-base-v2` (jina) / `rerank-english-v3.0` (cohere, no local weights) | XLM-RoBERTa cross-encoder (bge/jina) / Qwen2 + Linear(hidden, 1) head (mxbai) / Cohere `/v1/rerank` HTTP proxy (cohere) | ✅ bge + mxbai + jina + cohere all implemented | MIT (bge/mxbai/jina via XLM-R + Qwen2) + Cohere-hosted. [bge-reranker-base](https://huggingface.co/BAAI/bge-reranker-base), [mxbai-rerank-base-v2](https://huggingface.co/mixedbread-ai/mxbai-rerank-base-v2), [jina-reranker-base-v2](https://huggingface.co/jinaai/jina-reranker-base-v2) |
+| **Embedding** | candle (BERT) | `all-minilm-l6-v2` (candle) | MiniLM BERT bi-encoder | ✅ candle implemented | Apache-2.0, [Model card](https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2). Supports `encoding_format: "float"` (default) and `"base64"`. Batched forward via `BatchLongest` padding + single BERT pass. |
+| **Vision** | candle (YOLOv8 / RT-DETR / DETR) / ultralytics (Grounding DINO) / ONNX (pluggable: ort / tract / onnxruntime) | `yolov8n` / `yolov8s` / `yolov11n` (candle); `rtdetr-r50` / `detr-resnet50` (candle); `rf-detr-base` / `rf-detr-large` (ONNX, pluggable backend); `grounding-dino-base` (ultralytics); `florence-2-base` (ONNX, pluggable backend) | YOLOv8 CSPDarknet + PANet + decoupled head; RT-DETR / DETR transformer decoder (no NMS); RF-DETR query-based with DINOv2 backbone; Grounding DINO text-prompted; Florence-2 vision-language | ✅ `OrtVisionRuntime` with full task dispatch (detect / classify / segment / pose); pluggable ONNX session backend; **both YOLOv8 (anchor+NMS) and DETR/RF-DETR (query+sigmoid) output decoders** | COCO 80 base classes; **dynamic extension via LoRA adapters** (see `/v1/vision/lora/register`). 4 task endpoints (`/v1/vision/{detect,classify,segment,pose}`) + LoRA management endpoints. The ONNX backend decouples session construction (`OrtSession` type alias) from inference — replace `build_session` in `src/vision/ort_runtime.rs` to wire in `ort`, `tract`, `onnxruntime`, or any other ONNX executor. Apache-2.0 throughout (YOLOv8 is a clean-room architecture reimplementation in `src/vision/yolov8_arch.rs`; RT-DETR / DETR / RF-DETR / Florence-2 are architecture-only adaptations). |
+
+### All Supported Engines
+
+neure currently supports **4 inference engines** across **3 ML frameworks**, powering **6 model types** (LLM / TTS / ASR / Rerank / Embedding / Vision):
+
+| Engine | Framework | Model types backed | Status | License | Build requirements |
+|---|---|---|---|---|---|
+| **candle** | [candle](https://github.com/huggingface/candle) 0.10.2 (Rust) | LLM (Qwen2/3, Llama2/3, Phi-3, Mistral, ChatGLM), ASR (Whisper), Rerank (BGE-reranker), Embedding (MiniLM), Vision (YOLOv8 / RT-DETR / DETR) | ✅ fully implemented | Apache-2.0 / MIT | None — built into the default `candle` feature; pulls candle-core/nn/transformers from git rev `a9667ca` |
+| **burn** | [burn](https://github.com/tracel-ai/burn) (Rust) | TTS (VoxCpm, vendored from [voxcpm_rs](https://github.com/madushan1000/voxcpm_rs)) | ✅ fully implemented (consumes pre-converted `.mpk` weights) | Apache-2.0 (in-house voxcpm_rs) | Optional `voxcpmm` Cargo feature; `bazel` not required (pure Rust ndarray backend) |
+| **litert_lm** | [litert_lm](https://github.com/maceip/litert-lm-rs) 0.1 (process pool, shells out to the `lit` binary) | LLM only (Gemma 3 family, via Google LiteRT-LM) | ✅ fully implemented | Apache-2.0 | Optional `litert` Cargo feature; needs the `lit` binary on `PATH` (downloads Gemma weights on first `load()`) |
+| **mistralrs** | [mistral.rs](https://github.com/EricLBuehler/mistral.rs) v0.8.22 (candle-based) | LLM only (40+ model families: Qwen, Llama, Mistral, DeepSeek, GLM, Granite, GPT-OSS, Gemma 4, Qwen 3-VL, Phi 4 multimodal, etc.) | ✅ fully implemented (LLM only) | MIT | Optional `mistralrs` Cargo feature; pulls `candle`; network access required for HuggingFace model downloads on first `load()` |
+| **ONNX (pluggable)** | Pluggable — `ort`, `tract`, `onnxruntime`, or any other executor implementing the `OrtSession` contract | Vision (Florence-2, RT-DETR-ONNX, DETR-ONNX, custom ONNX exports) | ✅ `OrtVisionRuntime` + postprocessing wired; backend plug-in point at `build_session` in `src/vision/ort_runtime.rs` | Apache-2.0 / MIT (per executor) | Bring your own ONNX executor; the runtime handles all I/O, letterbox preprocessing, output decoding, and NMS |
+
+**Summary of what each engine does**:
+
+- **candle** — Hugging Face's pure-Rust ML framework, used for four of the five model types. Selected as the default for LLM/ASR/Rerank/Embedding because it has zero system dependencies and excellent Rust integration.
+
+- **burn** — Tracel.ai's pure-Rust ML framework, used for TTS because VoxCpm is not in candle-transformers. The full VoxCpm architecture (MiniCPM-4 + Local Encoder + Local DiT + AudioVAE) is vendored from the [madushan1000/voxcpm_rs](https://github.com/madushan1000/voxcpm_rs) project and adapted to burn 0.21. **Neure consumes pre-converted `.mpk` weights directly** — pull them from a HuggingFace repo that ships the burn format, or convert offline with the upstream voxcpm_rs utility and drop the result into `NEURE_TTS_MODEL_PATH`. Weight conversion is not in neure's scope.
+
+- **litert_lm** — Uses the [litert_lm](https://github.com/maceip/litert-lm-rs) 0.1 crate's `LitManager` API, which spawns the `lit` binary as a subprocess pool (one process per model, with `tokio` mpsc control channel inside each process for prompt + token streaming). Targeted at on-device / edge inference scenarios. The current `lit` registry ships Gemma 3 at three size classes (E2B, E4B, 12B); neure validates the model name against this set in `LitertLlmRuntime::validate_model_name` before calling `lit pull`. Native streaming is supported via `run_completion_stream`. The `lit` binary must be on `PATH`; neure does not bundle it.
+
+### How to load real model weights
+
+**LLM** (six families — Qwen, Llama, Phi-3, Mistral, ChatGLM):
+
+The architecture is auto-detected from `config.json`'s `model_type` field. Supported: `qwen2` / `qwen2_5` / `qwen2.5`, `qwen3` / `qwen3_5` / `qwen3.5` / `qwen3moe` (Qwen family), `llama` / `llama2` (Llama 2 + Llama 3 / 3.1 / 3.2), `phi3` (Microsoft Phi-3 mini / small / medium), `mistral` (Mistral 7B), `chatglm` (ChatGLM3). The same `NEURE_LLM_RUNTIME=candle` works for all of them; each family dispatches to its own `candle_transformers::models::*` module.
+
+**Inference**: real token generation via greedy argmax + the model's built-in KV cache. The first forward pass consumes the full prompt; subsequent passes consume one new token at a time with the offset incremented. Generation stops at the first matching event among EOS (`<|im_end|>` for Qwen 2.x, `<|endoftext|>` for Qwen 3.x / 3.5), any string in the request's `stop` field (up to 4 OpenAI-style stop sequences, matched as a suffix of the decoded text — the stop sequence itself is not emitted), or `max_tokens` (default 256, capped at 2048). Each stop reason produces `finish_reason: "stop"` (or `"length"` for `max_tokens`).
+
+```bash
+# 1. Download from HuggingFace (one of):
+huggingface-cli download Qwen/Qwen2.5-0.5B-Instruct --local-dir /data/models/qwen2.5-0.5b
+# OR manually download config.json + tokenizer.json + model.safetensors to a directory
+
+# 2. Set the env vars
+export NEURE_LLM_RUNTIME=candle
+export NEURE_LLM_MODEL_PATH=/data/models/qwen2.5-0.5b
+
+# 3. Start neure as usual
+./neure
+```
+
+**Rerank** (BGE-reranker, e.g. `BAAI/bge-reranker-base`):
+
+```bash
+# 1. Download from HuggingFace
+huggingface-cli download BAAI/bge-reranker-base --local-dir /data/models/bge-reranker-base
+# OR manually download config.json + tokenizer.json + model.safetensors to a directory
+
+# 2. Set the env vars
+export NEURE_RERANK_RUNTIME=candle
+export NEURE_RERANK_MODEL_PATH=/data/models/bge-reranker-base
+
+# 3. Start neure as usual
+./neure
+```
+
+### Per-model details
+
+#### LLM (chat completions)
+- **Engine**: candle (Qwen3 via `candle-transformers`)
+- **Enable real engine**: `NEURE_LLM_RUNTIME=candle`
+- **Model path**: `NEURE_LLM_MODEL_PATH=/path/to/qwen3-weights`
+- **Required files in model dir**: `config.json`, `tokenizer.json`, `*.safetensors`
+- **Input format**: OpenAI chat completions (`POST /v1/chat/completions`)
+- **Streaming**: `stream: true` returns Server-Sent Events. One `data: {…}` event per generated token (decoded via `tokenizer.id_to_token`, with SentencePiece U+2581 replaced by space), terminated by `data: [DONE]`. The first event has `delta.role: "assistant"`; the last has `finish_reason: "stop"` if the stream ended on a stop sequence or EOS, or `"length"` if `max_tokens` was hit. The request's `stop` field (string or array of up to 4 strings) is honored — the matching suffix is detected after each token and the stream is truncated before the stop string is sent.
+- **Sampling**: `temperature`, `top_p`, and `top_k` are all honored by the candle runtime (temperature-scaled softmax with optional top-p/nucleus and/or top-k truncation; `fastrand` sampling; `temperature <= 0`, `top_p <= 0`, or `top_k == 0` falls back to greedy argmax; `top_p >= 1.0` and `top_k >= vocab_size` disable truncation; top-p and top-k compose). The LiteRT runtime ignores these fields. `top_k` is a neure extension (OpenAI does not support it on `/v1/chat/completions`).
+- **FlashAttention (opt-in)**: build with `--features flash-attn` and set `NEURE_USE_FLASH_ATTN=1` at runtime to flip `Config::use_flash_attn`. Supported architectures: **Llama 2/3** and **Mistral** ship the field in `candle-transformers` 0.9.2; **Qwen 2/2.5 and Qwen 3/3.5** are supported via vendored attention modules in `src/llm/vendor/` (with `use_flash_attn` + `From<upstream::Config>` + flash-attn forward branch). Phi-3 and ChatGLM do NOT support flash-attn — they emit a warning when the env var is set and silently use SDPA. Defaults to `false` because flash-attn requires the `candle-flash-attn` crate (CUDA-only) and a CUDA device at runtime — the sdpa path is correct for CPU and Metal. The `flash-attn`, `metal`, and `cuda` features are all opt-in; `--features metal` / `--features cuda` enable the corresponding `candle` backend.
+
+  **Building flash-attn on a CUDA machine:** `flash-attn` pulls `candle-flash-attn` (via `cudarc`), which invokes `nvcc` during the build script. On a CUDA developer box use the helper script to validate the feature end-to-end:
+
+  ```bash
+  scripts/build-flash-attn.sh         # cargo check + build + test
+  scripts/build-flash-attn.sh smoke   # cargo check --examples (verifies vendored Qwen2/3 APIs resolve)
+  ```
+
+  The script detects `nvcc` on PATH (or honors `NVCC=` / `CUDA_HOME=` overrides) and exits with a specific code (`10` no nvcc, `11` CUDA too old, `20..23` cargo failure stages). It refuses to silently fall back to SDPA — if you run it on a non-CUDA box, it fails loudly with install instructions.
+
+**LiteRT LM engine (third-party, optional)**: For on-device / edge inference, neure can use Google's LiteRT-LM via the `litert_lm` Rust bindings (https://github.com/maceip/litert-lm-rs). Enable with:
+```bash
+NEURE_LLM_RUNTIME=litert NEURE_LLM_MODEL_PATH=/path/to/model.tflite
+```
+
+**Build requirements**: bazel + C++ toolchain + pre-built `libengine` from https://github.com/google-ai-edge/LiteRT-LM. The `litert` Cargo feature is opt-in (`cargo build --features litert`).
+
+**Limitations**: No chat templates (basic `role: content\n` template), no sampling parameters, no token counting (chars/4 estimate), `.tflite` format only, CPU backend only (GPU requires CUDA). Streaming IS supported via `run_completion_stream` and produces one `data: {…}` event per token, terminated by `data: [DONE]`, with the same `stop`/`max_tokens` semantics as the candle LLM path.
+
+**Mistral.rs engine (third-party, optional)**: For unified coverage of 40+ model families (Qwen, Llama, Mistral, DeepSeek, GLM, Granite, GPT-OSS, Gemma 4 multimodal, Qwen 3-VL, Phi 4 multimodal, etc.) with built-in PagedAttention, prefix caching, ISQ quantization, and per-token streaming — without writing per-family dispatch code in neure — enable the `mistralrs` Cargo feature:
+
+```bash
+cargo build --features mistralrs
+NEURE_LLM_RUNTIME=mistralrs NEURE_LLM_DEFAULT_MODEL="Qwen/Qwen3-0.6B" ./neure
+```
+
+**Model identifier convention**: mistral.rs expects a HuggingFace repo id (e.g. `Qwen/Qwen3-4B`) or a local path it can resolve via `hf_hub`. The `model_id` from `with_llm_model(...)` is passed through directly.
+
+**ISQ (in-situ quantization)**: controlled by `NEURE_MISTRALRS_ISQ` env var. Accepts `q4_0` (default; safe for CPU/Metal), `q8_0`, or `none` (load at native precision). On CUDA, mistral.rs's `with_auto_isq` selects the best format for the detected hardware.
+
+**Network access**: mistral.rs downloads weights from HuggingFace on first `load()` if they're not already cached at `~/.cache/huggingface/`. Subsequent loads use the cache.
+
+**Limitations vs candle path**: No token-level sampling parameter controls (temperature/top_p/top_k) on neure's side — mistral.rs handles sampling internally. The `max_tokens` and `stop` fields are still honored. Token counts are reported via mistral.rs's `Usage` struct (prompt_tokens, completion_tokens, total_tokens + tok/sec metrics).
+
+**License**: mistral.rs is MIT, which is compatible with neure's Apache-2.0 (permissive upstream combines cleanly with permissive downstream).
+
+#### TTS (text-to-speech)
+- **Engine**: burn (VoxCpm via vendored voxcpm_rs code, burn 0.21 with ndarray backend)
+- **Enable real engine**: `NEURE_TTS_RUNTIME=burn` (requires `--features voxcpm`)
+- **Model path**: `NEURE_TTS_MODEL_PATH=/path/to/burn-models`
+- **Required files in model dir**: `config.json` (VoxCPMConfig), `tokenizer.json`, `model.mpk` (pre-converted burn weights), `audiovae.mpk` (pre-converted burn weights for AudioVae)
+- **Input format**: OpenAI audio speech (`POST /v1/audio/speech`)
+- **Obtaining weights**: neure does not perform weight conversion. Either (a) point `POST /v1/models/pull` at a HuggingFace repo that already ships `.mpk` files for VoxCpm, or (b) use the upstream [voxcpm_rs](https://github.com/madushan1000/voxcpm_rs) `convert_voxcpm.py` script offline and drop the resulting `.mpk` files into the path.
+
+#### ASR (speech-to-text)
+- **Engine**: candle (Whisper via `candle-transformers::models::whisper`)
+- **Enable real engine**: `NEURE_ASR_RUNTIME=candle`
+- **Model path**: `NEURE_ASR_MODEL_PATH=/path/to/whisper-weights`
+- **Required files in model dir**: `config.json`, `tokenizer.json`, `preprocessor_config.json`, `*.safetensors`, `mel_filters.safetensors` or `mel_filters.npz`
+- **Input format**: OpenAI audio transcriptions (`POST /v1/audio/transcriptions`, multipart)
+- **Known limitations**:
+  - **Multi-format audio**: WAV works out of the box; **MP3 / FLAC / OGG-Vorbis** require building with `--features asr-audio` (pulls in `symphonia`). Format is auto-detected via magic-byte sniffing in `src/asr/audio.rs::detect_format`.
+  - 16kHz sample rate required (other rates are resampled to 16kHz mono via linear interpolation)
+  - Stereo is downmixed to mono
+
+#### Rerank (cross-encoder relevance)
+- **Engine**: candle (XLM-RoBERTa cross-encoder via `candle-transformers`)
+- **Engine selection** (`NEURE_RERANK_RUNTIME`):
+  - `bge` (default; also accepts deprecated alias `candle` with a `tracing::warn!`) — BGE-reranker cross-encoder
+  - `mxbai` — mxbai-rerank-base-v2 (Qwen2 backbone + Linear(hidden, 1) classification head; per-doc forward with the official `"Represent this sentence to search relevant passages: "` query prefix)
+  - `jina` — jina-reranker-base-v2 (XLMRobertaForSequenceClassification with optional `query_prefix` / `document_prefix` from config.json)
+  - `cohere` — Cohere-hosted rerank (e.g. `rerank-english-v3.0`); requires `NEURE_COHERE_API_KEY`, optional `NEURE_COHERE_ENDPOINT` and `NEURE_COHERE_MODEL`. **No local weights needed** — proxies to Cohere's hosted `/v1/rerank` API.
+- **Model path**: `NEURE_RERANK_MODEL_PATH=/path/to/<model>-weights` (BGE/mxbai/jina only — cohere uses the API)
+- **Required files in model dir** (BGE/mxbai/jina): `config.json`, `tokenizer.json`, `model.safetensors`
+- **Input format**: `POST /v1/rerank` with `{query, documents, top_n?, return_documents?}`
+- **Output format**: OpenAI list/data envelope — `{object: "list", model, data: [{index, relevance_score, document?}, ...], usage}`
+- **Score normalization**: sigmoid of model logit → [0, 1]
+- **Known limitations**:
+  - Cross-encoder only (not bi-encoder) — N documents requires N forward passes
+  - Max sequence length: 512 tokens (query + document) for BGE; the mxbai/jina stubs honor whatever the upstream model declares
+  - Tokenizers v0.22 uses separate encoding + concatenation (workaround for missing pair-encoding API)
+  - mxbai/jina now have **real forward passes** wired. mxbai uses Qwen2 + Linear head (last-token hidden state → logit → sigmoid). Jina reuses the BGE XLM-R path with optional `query_prefix` / `document_prefix` from config.json; handles both num_labels=1 and num_labels=2 (older v1) output shapes.
+
+#### Embedding (text-to-vector)
+- **Engine**: candle (`candle-transformers::models::bert`)
+- **Enable real engine**: `NEURE_EMBEDDING_RUNTIME=candle`
+- **Model path**: `NEURE_EMBEDDING_MODEL_PATH=/path/to/all-MiniLM-L6-v2-weights`
+- **Required files in model dir**: `config.json`, `tokenizer.json`, `model.safetensors`
+- **Input format**: OpenAI embeddings (`POST /v1/embeddings`, JSON body — `input` is a single string or array of strings)
+- **Output format**: OpenAI list/data envelope — `{object: "list", model, data: [{object: "embedding", index, embedding: [f32, ...]}, ...], usage: {prompt_tokens, total_tokens}}`
+- **Pooling**: mean-pool over the last hidden state, weighted by the attention mask, then L2-normalize (standard sentence-transformers pipeline)
+- **Known limitations**:
+  - `encoding_format: "float"` (default; `[f32, ...]` array) and `"base64"` (compact: f32 LE bytes base64-encoded into a single string) are both supported. Unknown formats return 400.
+  - **Batched forward**: `tokenizer.encode_batch` with `BatchLongest` padding, single BERT forward, per-row mean-pool — the request handler does NOT loop per-text anymore
+  - 384-dim output (all-MiniLM-L6-v2 native dimension)
+
+#### Vision (multi-model, multi-task + dynamic LoRA)
+- **Engines (4 backends)**:
+  - `candle` — YOLOv8 (detect / classify / segment / pose), RT-DETR, DETR
+  - `ort` (ONNX Runtime, opt-in) — Florence-2, RT-DETR-ONNX, DETR-ONNX, custom ONNX exports
+  - `ultralytics` (Python subprocess) — Grounding DINO, YOLO-World (open-vocabulary)
+- **HTTP endpoints**: 4 per-task routes — `POST /v1/vision/{detect,classify,segment,pose}` (each forces its task discriminator, returns the right `VisionResponse` variant). Plus the legacy `POST /v1/vision/detect` that accepts `task` in the body.
+- **Wire format**: OpenAI-shaped `image_url` content part (URL, base64, or data URL)
+- **Preprocessing**: aspect-ratio-preserving letterbox to 640×640, gray padding (114), f32 [0, 1] CHW
+- **Postprocessing** (YOLO family): per-class NMS (IoU threshold), confidence threshold, max-detections cap, optional class-id filter
+- **Model catalog (9 default entries)**: `yolov8n`, `yolov8s`, `yolov11n`, `rtdetr-r50`, `detr-resnet50`, `rf-detr-base`, `rf-detr-large`, `grounding-dino-base`, `florence-2-base`
+- **Status (2026-07-03)**:
+  - All preprocessing + per-task dispatch + response shape wired
+  - LoRA class extension end-to-end (class-ID allocation, runtime validation, `lora_id` source attribution)
+  - YOLOv8 / RT-DETR / DETR / Florence-2 / Grounding DINO forward-pass architectures are placeholders pending real weights — call sites return `not_implemented` until the architecture is implemented
+  - 7 model families ready to be wired into runtimes: each requires only the architecture + safetensors loader
+- **Dynamic class extension via LoRA**: register custom YOLO LoRA adapters at runtime to recognize new classes beyond the 80 base COCO classes (see below)
+
+##### LoRA — dynamic class extension
+
+Add custom detection classes (e.g. "warehouse pallet", "forklift", "package") without retraining the base YOLO model. Each LoRA adapter contributes its own classes; class IDs are allocated starting at 80 (after the 80 base COCO classes) and remain stable for the lifetime of the registry.
+
+**Register an adapter:**
+```bash
+curl -X POST http://localhost:8083/v1/vision/lora/register \
+  -H "Content-Type: application/json" \
+  -d '{
+    "id": "warehouse-v1",
+    "name": "Warehouse detection v1",
+    "weight_path": "/opt/models/loras/warehouse-v1",
+    "base_model": "yolov8n",
+    "custom_classes": ["pallet", "forklift", "package"]
+  }'
+# → 200 { "id": "warehouse-v1", "status": "loaded", "class_id_start": 80, "class_id_end": 83 }
+```
+
+**List registered adapters:**
+```bash
+curl http://localhost:8083/v1/vision/lora/list
+# → 200 { "adapters": [{ "id": "warehouse-v1", ... }] }
+```
+
+**Use a LoRA-merged model in detection:**
+```bash
+curl -X POST http://localhost:8083/v1/vision/detect \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "yolov8n",
+    "image": { "type": "image_url", "image_url": { "url": "..." } },
+    "lora_adapters": ["warehouse-v1"]
+  }'
+# → 200 { "detections": [{ "class_id": 81, "class_name": "forklift", "lora_id": "warehouse-v1", ... }] }
+```
+
+**Unregister:**
+```bash
+curl -X DELETE http://localhost:8083/v1/vision/lora/warehouse-v1
+# → 204 No Content
+```
+
+**Adapter file layout** (training-side convention, matches HuggingFace peft):
+```
+<weight_path>/
+  metadata.json     # LoraAdapterMeta fields (id, name, base_model, rank, alpha, target_modules, custom_classes)
+  lora.safetensors  # keys: lora_A.<module>, lora_B.<module> (A: [rank, in_dim], B: [out_dim, rank])
+```
+
+**Status (2026-07-03)**: metadata + class-ID allocation + HTTP API + 12 unit tests implemented. The actual weight merge `W' = W + α·B·A` is deferred to v1.1 alongside the YOLOv8 forward pass. v1.0 returns `not_implemented` from `detect` when LoRA adapters are requested; the class-id allocation and validation work end-to-end.
+
+##### ONNX backend (pluggable)
+
+The `OrtVisionRuntime` provides an ONNX inference path that **decouples session construction from the rest of the inference pipeline**. The runtime owns all I/O (image fetch + decode + letterbox), tensor construction (CHW f32 [0,1] normalized), output decoding (YOLOv8 `[1, 84, 8400]` → per-class scores + bbox + class names), and NMS. Session construction is delegated to a `build_session` function that returns an `OrtSession` — a type alias users can back with any executor.
+
+**Why the decoupling**: the `ort` crate ecosystem is still settling (e.g. ort 2.0.0-rc.12 has a vitis.rs compile bug that breaks default builds). Decoupling session construction from the rest of the pipeline means the entire preprocessing, dispatch, postprocessing, and HTTP layer stays usable regardless of which ONNX executor the host wires in.
+
+**Currently supported by the runtime** (every step except session construction):
+- ✅ Image fetch (URL, base64, data URL, file_id)
+- ✅ Image decode (PNG, JPEG, WebP via `image` crate)
+- ✅ Letterbox preprocessing to 640×640 (gray padding 114)
+- ✅ NCHW float32 tensor construction ([0,1] normalized)
+- ✅ YOLOv8 ONNX output decoding (`[1, 84, 8400]` → Detections with NMS)
+- ✅ Classify / Segment / Pose dispatch + task-specific response shapes
+- ✅ LoRA class-id expansion lookup
+- ⏳ Session construction (`build_session` returns `not_implemented`)
+- ⏳ Inference `run()` call (returns `not_implemented` until session exists)
+
+**To wire in a real ONNX executor:**
+
+```rust
+// In src/vision/ort_runtime.rs — replace the placeholder `build_session`
+fn build_session(onnx_path: &Path) -> Result<OrtSession, NeureError> {
+    // 1. Load the model: e.g. with `ort`: session.commit_from_file(...)
+    // 2. Configure execution providers: CPU / CUDA / TensorRT / DirectML
+    // 3. Wrap the result in `OrtSession` (a type alias the user defines)
+    // 4. Return it.
+}
+
+// And `run_session` — call session.run(...), extract the output tensor,
+// flatten it to Vec<f32>, and return it.
+fn run_session(session: &mut OrtSession) -> Result<(Vec<f32>, Vec<i64>), NeureError> {
+    // 1. Build input tensor from the CHW f32 buffer
+    // 2. session.run(ort::inputs![input_name => tensor]?)
+    // 3. Extract output tensor by index, convert to Vec<f32>, return shape
+}
+```
+
+The runtime's `preprocess`, `decode_yolov8_output`, task dispatch, and response shape are all wired. Once `build_session` returns a valid session and `run_session` invokes it, end-to-end ONNX inference works for every model in the catalog (YOLOv8-ONNX, RT-DETR-ONNX, DETR-ONNX, Florence-2, custom exports).
+
+**Example catalog entries** (already registered):
+- `florence-2-base` (ort) — Florence-2 vision-language; Apache-2.0
+- `rtdetr-r50`, `detr-resnet50` (candle-yolo RT-DETR/DETR inference, ONNX-compatible output layout)
+- `rf-detr-base`, `rf-detr-large` (ort) — RF-DETR query-based detection; Apache-2.0
+
+##### RF-DETR (Roboflow DETR with DINOv2 backbone)
+
+RF-DETR is a query-based transformer detector from Roboflow that achieves state-of-the-art accuracy on real-world data. It differs from YOLOv8 in three important ways:
+
+1. **Output layout**: `[1, num_queries, 4 + num_classes]` instead of `[1, 4+nc, anchors]`. RF-DETR uses 300 object queries (DETR uses 100).
+2. **No NMS needed**: The set prediction head deduplicates automatically. We just threshold by confidence.
+3. **Sigmoid scores**: Class probabilities are sigmoid'd inside the model — no softmax needed at decode time.
+
+**Output layout discriminator**: The runtime uses the `output_layout` field in `config.json` to pick the right decoder:
+
+```json
+{
+  "input_name": "images",
+  "output_names": ["dets"],
+  "input_shape": [1, 3, 640, 640],
+  "num_classes": 80,
+  "task": "detect",
+  "output_layout": "detr",
+  "num_queries": 300
+}
+```
+
+When `output_layout = "detr"` (covers RF-DETR, RT-DETR, original DETR), the runtime uses `decode_rfdetr_output` instead of `decode_yolov8_output`. The DETR decoder:
+- Takes argmax over the class scores per query (no softmax)
+- Applies the confidence threshold (no IoU threshold)
+- Converts xywh from input coords back to original image coords (un-letterbox)
+- Sorts by confidence and truncates to `max_detections`
+
+**Test coverage** (5 new tests in `src/vision/ort_runtime.rs`):
+- `test_ort_output_layout_default_is_yolov8` — `OrtOutputLayout::default()` is YOLOv8
+- `test_ort_config_with_detr_layout` — JSON deserialization with `"output_layout": "detr"` works
+- `test_ort_decode_rfdetr_synthetic` — 4-query synthetic DETR output, 2 detections above threshold
+- `test_ort_decode_rfdetr_with_letterbox_unpadding` — coordinate transformation from 640x640 input to 1920x1080 original
+- `test_ort_decode_detection_output_dispatch` — unified `decode_detection_output` picks the right decoder per `output_layout`
+
+**Why use RF-DETR over YOLOv8?**
+- Higher mAP on real-world datasets (RF-DETR-base: 54.7 mAP COCO; YOLOv8m: 50.2 mAP COCO)
+- Better small-object detection
+- No NMS tuning needed
+- Open-source + commercially-friendly license (Apache-2.0)
+
+### Adding a new model type
+
+The pattern for adding a new model type (e.g., embedding, vision):
+
+1. **Define the trait** in `src/<model_type>/mod.rs`:
+   ```rust
+   #[async_trait]
+   pub trait <ModelType>Runtime: Send + Sync {
+       async fn load(model: &str, device: &DeviceSelection)
+           -> ChatResult<Box<dyn <ModelType>Runtime>> where Self: Sized;
+       async fn infer(&self, req: <ModelType>Request) -> ChatResult<<ModelType>Response>;
+       fn list_models(&self) -> Vec<ModelInfo>;
+       fn name(&self) -> &str;
+   }
+   ```
+
+2. **Implement the real runtime** in `src/<model_type>/<engine>.rs`, gated by `#[cfg(feature = "<engine>")]` in `mod.rs`. Use `candle_core` + `candle_nn` + `candle_transformers` for weight loading and forward pass. If a real engine isn't built for the requested model, the registry returns an `Unavailable*Runtime` error stub so the HTTP layer can report a clear 4xx error.
+
+4. **Add config fields** to `NeureConfig`:
+   - `<model_type>_model_path: Option<String>`
+   - `default_<model_type>_model: Option<String>`
+   - `with_<model_type>_model(model)` builder
+
+5. **Add to `ServerState`** — `pub <model_type>: Arc<dyn <ModelType>Runtime>`
+
+6. **Add HTTP endpoint** in `src/server/mod.rs` — follow the `/v1/rerank` pattern (DTO + handler + route).
+
+7. **Add to `/v1/models` and `/v1/info`** — register the capability.
+
+8. **Wire env-var dispatch** in `ServerState::new` (`NEURE_<TYPE>_RUNTIME`).
+
+9. **Add a default-model builder** on `NeureConfig` (`with_<model_type>_model(...)`) so embedded hosts can pick a default in code.
+
+10. **Add health check field** in `NeureHealth`.
+
+Swap in real weights anytime — every real engine produces wire-compatible output without changes to the HTTP layer.
+
+## Plugin architecture
+
+neure's inference layer is built around a Canonical type system that lets hosts plug in custom engines and API adapters without modifying neure's source. The core abstractions:
+
+- **`CanonicalRequest` / `CanonicalResponse` / `CanonicalStreamEvent`** — capability-discriminated enums (`Llm` / `Tts` / `Asr` / `Rerank` / `Embedding`) that cover every input shape across OpenAI ChatCompletions, Anthropic Messages v1, and future wire formats.
+- **`LlmRuntime` trait + `EngineRegistry<T>` + `CapabilityRegistries`** — per-capability engine storage with `register_engine()` / runtime lookup. The `LlmRuntimeBridge` wraps legacy `Arc<dyn ChatLlmRuntime>` engines as the new `Arc<dyn AnyCapabilityEngine>` so existing engines route through the new dispatch without rewriting.
+- **`ApiAdapter` trait + `AdapterRegistry`** — wire-format parsers/serializers registered per path. Currently registered: `OpenAiChatAdapter` (`/v1/chat/completions`), `AnthropicMessagesAdapter` (`/v1/messages`). Both adapters accept requests, translate to `CanonicalRequest`, dispatch to any registered `AnyCapabilityEngine`, and serialize the response back to their wire format.
+- **`CapabilityCatalog`** — `(model_id, engine_impl) → (modalities, api_styles, flags)` matrix used by `adapter_dispatch` to validate requests and select the right adapter.
+
+The dispatch flow:
+
+```
+HTTP request → AdapterRegistry::for_path(path)
+            → adapter.parse(body) → CanonicalRequest
+            → AnyCapabilityEngine::execute(CanonicalRequest)
+            → CanonicalResponse
+            → adapter.serialize_response(CanonicalResponse) → HTTP response
+```
+
+Hosts can register their own engines and adapters by implementing the respective traits and calling `register_engine(...)` / `register_adapter(...)` on `NeureHandle`. See `src/engine/mod.rs` and `src/adapter/mod.rs` for the trait shape.
+
+## Status (2026-06)
+
+**Completed** ✅:
+- Project skeleton (single Cargo crate with feature-gated modules)
+- Trait surface: `LlmRuntime`, `TtsRuntime`, `AsrRuntime`, `RerankRuntime` (matches Prefrontal's existing provider shapes)
+- OpenAI-shaped types: `ChatRequest`, `ChatResponse`, `ChatChunk`, `ChatMessage` with `ChatContent` (text + multimodal parts), `SseEvent` for streaming
+- OpenAI-compatible HTTP server (axum 0.8): all inference endpoints listed above
+- `run_embedded()` entry for Tauri / Flutter FFI / Rust host processes
+- **Model management API**: 5 new endpoints (list/get/pull/pull-status/delete) + `Source` plugin architecture for adding new download sources
+- **Real engine implementations**: `CandleLlmRuntime` (Qwen3), `CandleRerankRuntime` (BGE-reranker/XLM-RoBERTa), `WhisperAsrRuntime` (full Whisper), `VoxCpmTtsRuntime` (vendored burn implementation), `LitertLlmRuntime` (Google LiteRT-LM via FFI)
+- **Engine selection via env vars**: `NEURE_LLM_RUNTIME`, `NEURE_TTS_RUNTIME`, `NEURE_ASR_RUNTIME`, `NEURE_RERANK_RUNTIME` each accept `candle`, `litert`, `voxcpm`; `NEURE_LLM_RUNTIME` also accepts `mistralrs` (requires `--features mistralrs`)
+- 7 unit tests pass (LLM trait, types serialization, embedded health, server)
+- `cargo check` + `cargo test --lib` + `cargo build --lib` all green
+- `RerankRuntime` trait + 4 real engine backends (BGE / mxbai / jina / cohere)
+- POST `/v1/rerank` endpoint with OpenAI-shaped list/data envelope and strict error envelope (param field)
+- Rerank fields in `NeureConfig` + `with_rerank_model(...)` builder + `NeureHealth.rerank_loaded`
+- `CandleRerankRuntime` fully implemented (XLM-RoBERTa cross-encoder + sigmoid scoring)
+- `VoxCpmTtsRuntime` full implementation (vendored burn 0.21, ~2500 lines adapted, consumes pre-converted `.mpk` weights)
+- `WhisperAsrRuntime` full implementation (candle-transformers::models::whisper, WAV decode + mel + encoder/decoder loop, 596 lines)
+- Qwen 2 / 2.5 / 3 / 3.5 architecture auto-detection in `CandleLlmRuntime` from `config.json` `model_type`
+- Six-family LLM support in `CandleLlmRuntime`: Qwen 2 / 2.5 / 3 / 3.5, Llama 2 / 3 / 3.1 / 3.2, Phi-3 (mini / small / medium), Mistral 7B, ChatGLM3. Each family dispatches to its own `candle_transformers::models::*` module via a 6-variant `CausalArch` enum. Model_type field is `qwen2` / `qwen2_5` / `qwen3` / `llama` / `phi3` / `mistral` / `chatglm`.
+- Real per-token streaming for candle Qwen: one `data: {…}` event per generated token (decoded via `tokenizer.id_to_token` with SentencePiece U+2581 → space), terminated by `data: [DONE]`
+- `ChatRequest.stop` honored end-to-end: up to 4 stop strings matched as a suffix of the decoded text, stream truncated before the stop is sent, `finish_reason: "stop"`
+- 149 unit tests pass (`cargo test --lib`), `cargo build --lib` clean
+- **Optional FlashAttention feature flag** for long contexts: `Cargo.toml` exposes `flash-attn` / `metal` / `cuda` features. The Llama 2 / 3 + **Mistral** candle backends read `NEURE_USE_FLASH_ATTN=1` to flip `Config::use_flash_attn`; defaults to `false` (sdpa path, correct for CPU/Metal). For **Qwen 2 / 2.5 / 3 / 3.5** the upstream `Config` doesn't expose the field — neure vendors those modules in `src/llm/vendor/` (with `use_flash_attn` + `From<upstream::Config>` + flash-attn forward branch) and routes the `Qwen2/3` arms through them when `--features flash-attn` is on and the env var is set. Phi-3 / ChatGLM still trigger a `tracing::warn!` and fall back to SDPA. Truthy values: `1` / `true` / `TRUE` / `yes`; falsy: `0` / `false` / `FALSE` / `no`. 4 unit tests cover the parser.
+- **Multi-reranker support**: BGE-reranker (XLM-RoBERTa), mxbai-rerank-base-v2 (Qwen2 + Linear head), jina-reranker-base-v2 (XLM-R with optional prefixes), **and Cohere (API proxy)** — all 4 families are wired. `NEURE_RERANK_RUNTIME` accepts `bge` (default), `candle` (deprecated alias for `bge` with a warn), `mxbai`, `jina`, `cohere`. `RerankImpl::Bge` is the new canonical variant; `RerankImpl::Candle` is kept as a deprecated alias for one release cycle. Cohere is the only one that doesn't need local weights — it forwards to Cohere's `/v1/rerank` and translates the `results` field into the OpenAI `data` envelope.
+- **ASR multi-format decoding**: WAV works out of the box. **MP3 / FLAC / OGG-Vorbis** are gated behind the new `asr-audio` Cargo feature (pulls in `symphonia`). Format is auto-detected via magic-byte sniffing in `src/asr/audio.rs::detect_format`; decoded to 16kHz mono f32 via `decode_to_pcm16k_mono`. Linear interpolation resampling (rubato recommended for production). 8 unit tests + 1 integration test.
+- **TTS chunked-transfer streaming**: `/v1/audio/speech` request gains an optional `stream: bool` field. When `true`, the response is `axum::body::Body::from_stream(...)` with chunked transfer encoding — the client gets audio bytes progressively instead of waiting for the full synthesis. The `TtsRuntime` trait has a default `synthesize_stream` impl that yields 16 KiB chunks of the synthesized audio.
+- **Embedding base64 encoding**: `embedding_format: "base64"` now works (was 501). The `EmbeddingVector` enum serializes as `Float(Vec<f32>)` (default) or `Base64(String)` (compact: f32 LE bytes → base64). New `EncodingFormat` enum + `base64_encode` helper (RFC 4648, no external dep). 7 new unit tests.
+- **Embedding batched forward**: `MiniLmL6V2EmbeddingRuntime::embed` now uses `tokenizer.encode_batch` with `BatchLongest` padding, then a single BERT forward, then per-row mean-pool. Math is identical per text; only the kernel launch count drops from N to 1.
+- **Criterion benchmark suite** under `benches/perf.rs`: 22 benchmarks across all 5 model types. Run with `cargo bench --bench perf` (full) or `cargo bench --bench perf -- --quick` (CI smoke).
+- **Cohere rerank smoke example** (`examples/real_model_rerank_cohere_smoke.rs`): runs against a local axum mock server by default (no API key needed) — verifies ranking, `top_n`, and `return_documents` semantics end-to-end. Switches to real Cohere API when `NEURE_COHERE_API_KEY` is set. `pub fn spawn_mock` extracted from `#[cfg(test)]` so the example and unit tests share the same mock logic.
+- **`NEURE_PORT` + `NEURE_HOST` env-var parsing fix**: `NeureConfig::from_env_map()` now reads both vars (previously documented but only `NEURE_PORT` was parsed). `embedded.rs` bind error message uses the actual host instead of hardcoded `0.0.0.0`. Deleted fragile inline test, added 4 `from_env_map`-backed tests.
+- **`scripts/build-flash-attn.sh`**: validates the opt-in `--features flash-attn` end-to-end on a CUDA developer box. Detects `nvcc` on PATH (or honors `NVCC=` / `CUDA_HOME=` overrides), checks CUDA ≥ 11.0, then runs `cargo check + build + test` and a `smoke` subcommand that exercises the vendored Qwen2/3 APIs. Fails loudly with exit codes `10` (no nvcc) / `11` (CUDA too old) / `20..23` (cargo failure stages) instead of silently falling back to SDPA. `help` subcommand works without nvcc.
+- **Config/env refactor**: `NeureConfig::from_env_map` split into 7 `apply_*_env` named functions (port, host, model_dirs, default_source, per-engine, per-model, source_endpoints), shrinking the entry point to 8 lines. New `NeureConfig::validate()` entry point. New `ensure_dir` helper extracted and applied to 8 copy-pasted `resolve_model_path` sites across `llm/candle_runtime.rs`, `asr/whisper.rs`, `tts/voxcpm.rs`, `embedding/candle.rs`, `rerank/{candle,jina,mxbai}.rs` — net -22 lines, 3 new tests. `ensure_dir` deliberately does NOT read the env var; each caller reads its own to preserve runtime-specific hints.
+- **Echo stub removal (2026-06-30)**: removed all `Echo*Runtime` stubs (LLM / TTS / ASR / Rerank / Embedding), the corresponding `*Impl::Echo` enum variants, the `"echo"` env-var selection path, and the `tests/integration.rs` (50 echo-driven HTTP tests). Each registry now exposes a `default_runtime()` method that returns an `Unavailable*Runtime` error stub — every `infer` / `chat` / `synthesize` / `transcribe` / `rerank` / `embed` call against an unregistered or unloadable model returns `NeureError::not_initialized(...)` so the HTTP layer can surface a clear 4xx response. `benchmarks/perf.rs` was trimmed of echo-only benchmarks (LLM / TTS / Rerank doc-count) and now keeps the data-structure benches (`base64_encode_micro`, `rerank_response_*`, `model_info_*`).
+- 310 lib tests pass with `--features candle` (0 failures, 0 warnings). Echo-based integration tests removed in the 2026-06-30 stub-removal pass — the registries now return `Unavailable*Runtime` error stubs when no real engine is built for the requested capability, so integration tests need real model weights + the corresponding feature flag to exercise the HTTP layer end-to-end.
+
+**Vision + LoRA (2026-07-03)**: added a 6th first-class capability `vision` (object detection via YOLOv8) with full preprocessing pipeline (aspect-ratio-preserving letterbox to 640×640, gray padding), per-class NMS, OpenAI-shaped `/v1/vision/detect` endpoint, and **dynamic LoRA-based class extension** via `POST /v1/vision/lora/register`. LoRA adapters are loaded into memory at runtime, contribute their custom classes (allocated stable IDs ≥ 80, after the 80 base COCO classes), and the merged class registry is consulted via `Detection.lora_id` so clients can tell base COCO detections from LoRA-added ones. 352 lib tests pass (12 new LoRA unit tests, 22 new vision unit tests). YOLOv8 forward pass is a placeholder pending real weights; the metadata + class-ID allocation + HTTP API work end-to-end.
+
+**Stub mode (historical, removed in 2026-06-30)**: prior versions shipped an `echo` runtime that returned user input verbatim so the wire format could be validated without model weights. That stub layer has been removed; neure now requires a real engine backend selected via env vars (`NEURE_LLM_RUNTIME=candle`, `NEURE_TTS_RUNTIME=burn`, `NEURE_ASR_RUNTIME=candle`, `NEURE_RERANK_RUNTIME=bge|mxbai|jina|cohere`, `NEURE_EMBEDDING_RUNTIME=candle`). When no real engine is available, the registries return `Unavailable*Runtime` error stubs that produce clear 4xx errors from the HTTP layer.
+
+**Real model smoke runs (validated end-to-end)**:
+- **Embedding** — `all-MiniLM-L6-v2` (88 MB, 384-dim) via `cargo run --example real_model_smoke --features candle` (3 checks: float, base64, batched)
+- **Rerank** — `BAAI/bge-reranker-base` (1.08 GB, 768-dim XLM-R) via `NEURE_RERANK_RUNTIME=bge cargo run --example real_model_rerank_smoke --features candle` (3 checks: real scores, `top_n=1`, `return_documents=false`)
+- **Cohere (mock)** — `cargo run --example real_model_rerank_cohere_smoke --features candle` (3 checks against local axum mock, no API key)
+
+**Planned (TODO markers already in source)**:
+- (no remaining sampling parameters — all three of temperature, top_p, top_k are wired)
+- More Gemma sizes (Gemma 4 once it lands in the `lit` registry; also Gemma 27B if it fits)
+- Cohere real-API smoke (consumes credits — needs `NEURE_COHERE_API_KEY`)
+
+## Architecture
+
+```
+src/
+├── lib.rs                  # re-exports
+├── config.rs               # NeureConfig (port, host, model paths, feature flags, env vars)
+├── embedded.rs             # run_embedded() + NeureHandle + health() — for host processes
+├── api_error.rs            # Unified OpenAI-shaped error envelope
+├── llm/
+│   ├── mod.rs                  # LlmRuntime trait + OpenAI types + LlmImpl enum
+│   ├── candle_arch.rs          # CausalArch enum + auto-detection from config.json model_type
+│   ├── candle_runtime.rs       # Candle impl (candle feature) — 6-family dispatch + KV cache
+│   ├── candle_runtime_tests.rs # In-process integration tests for candle runtime
+│   ├── litert_runtime.rs       # LiteRT LM impl (litert feature) — Gemma 3 via `lit` subprocess
+│   ├── mistralrs_runtime.rs    # Mistral.rs impl (mistralrs feature) — 40+ model families
+│   ├── translators.rs          # OpenAI <-> Canonical request/response translation
+│   ├── registry.rs             # LlmRuntimeRegistry (lazy load + ResourceTracker + UnavailableLlmRuntime fallback)
+│   └── vendor/                 # Vendored candle_transformers models (flash-attn)
+│       ├── mod.rs
+│       ├── qwen2.rs            # Qwen2 with use_flash_attn (#[cfg(feature = "flash-attn")])
+│       └── qwen3.rs            # Qwen3 with use_flash_attn (#[cfg(feature = "flash-attn")])
+├── tts/
+│   ├── mod.rs              # TtsRuntime trait + TtsImpl enum
+│   ├── registry.rs         # TtsRuntimeRegistry (lazy load + ResourceTracker + UnavailableTtsRuntime fallback)
+│   ├── voxcpm.rs           # VoxCpmTtsRuntime (uses vendored burn model)
+│   └── voxcpm_burn/        # Vendored burn model code (voxcpm_rs, in-house, Apache-2.0)
+│       ├── mod.rs
+│       ├── voxcpm_model.rs     # Main VoxCpm + DiT
+│       ├── minicpm4.rs         # Text encoder
+│       ├── audiovae.rs         # Audio decoder
+│       └── compat.rs           # burn 0.21 API compat shim
+├── asr/
+│   ├── mod.rs              # AsrRuntime trait + AsrImpl enum
+│   ├── audio.rs            # Symphonia decode + rubato FFT resample + magic-byte sniffing
+│   ├── whisper.rs          # WhisperAsrRuntime (candle-transformers::models::whisper)
+│   └── registry.rs         # AsrRuntimeRegistry (lazy load + ResourceTracker + UnavailableAsrRuntime fallback)
+├── rerank/
+│   ├── mod.rs              # RerankRuntime trait + RerankImpl enum
+│   ├── candle.rs           # BGE-reranker (XLM-RoBERTa cross-encoder + sigmoid)
+│   ├── mxbai.rs            # mxbai-rerank-base-v2 (Qwen2 + Linear head)
+│   ├── jina.rs             # jina-reranker-base-v2 (XLM-R + optional prefixes)
+│   ├── cohere.rs           # Cohere /v1/rerank API proxy (no local weights)
+│   └── registry.rs         # RerankRuntimeRegistry (lazy load + ResourceTracker + UnavailableRerankRuntime fallback)
+├── embedding/
+│   ├── mod.rs              # EmbeddingRuntime trait + EmbeddingImpl enum
+│   ├── candle.rs           # MiniLmL6V2EmbeddingRuntime (BERT + mean-pool + L2-norm)
+│   └── registry.rs         # EmbeddingRuntimeRegistry (lazy load + ResourceTracker + UnavailableEmbeddingRuntime fallback)
+├── vision/                 # YOLOv8 + RT-DETR + DETR + Florence-2 detection + dynamic LoRA class extension
+│   ├── mod.rs              # VisionRuntime trait + VisionTask enum + VisionRequest/Response + VisionImpl
+│   ├── candle_yolo.rs      # CandleYoloRuntime (preprocessing + task dispatch + NMS)
+│   ├── ort_runtime.rs      # OrtVisionRuntime (pluggable ONNX backend: ort / tract / onnxruntime)
+│   ├── coco_classes.rs     # 80 base COCO class names
+│   ├── letterbox.rs        # Aspect-ratio-preserving image resize
+│   ├── nms.rs              # Per-class non-max suppression
+│   ├── lora.rs             # LoRA adapter types + LoraRegistry (dynamic class extension)
+│   └── registry.rs         # VisionRuntimeRegistry (lazy load + ResourceTracker + UnavailableVisionRuntime fallback)
+├── canonical/              # Canonical wire-format types (request / response / stream event)
+│   ├── mod.rs
+│   ├── types.rs            # CanonicalRequest / CanonicalResponse / CanonicalStreamEvent enums
+│   ├── content.rs          # Content blocks (text, multimodal parts)
+│   ├── sampling.rs         # temperature / top_p / top_k
+│   ├── tool.rs             # tool_use / tool_result blocks
+│   └── usage.rs            # Token usage counters
+├── engine/                 # Pluggable engine registry + LlmRuntimeBridge
+│   ├── mod.rs              # AnyCapabilityEngine trait
+│   ├── registry.rs         # CapabilityRegistries (per-capability storage)
+│   └── bridge.rs           # LlmRuntimeBridge (legacy Arc<dyn ChatLlmRuntime> -> new dispatch)
+├── adapter/                # Pluggable API adapter registry
+│   ├── mod.rs              # ApiAdapter trait + AdapterRegistry
+│   ├── openai_chat.rs      # OpenAiChatAdapter (/v1/chat/completions)
+│   ├── anthropic_messages.rs # AnthropicMessagesAdapter (/v1/messages)
+│   └── registry.rs
+├── capabilities/           # (model_id, engine_impl) -> (modalities, api_styles, flags)
+│   ├── mod.rs
+│   ├── modality.rs
+│   ├── api_style.rs
+│   ├── model_caps.rs
+│   └── catalog.rs
+├── models/                 # Model management: catalog, puller, sources
+│   ├── mod.rs
+│   ├── catalog.rs          # Supported + available models registry
+│   ├── source.rs           # Source trait (HuggingFace, ModelScope, custom)
+│   ├── huggingface.rs      # HuggingFaceSource (shells out to huggingface-cli)
+│   ├── puller.rs           # Async download job manager
+│   ├── job.rs              # PullJob state machine
+│   ├── registry.rs         # SourceRegistry
+│   └── handlers.rs         # HTTP handlers for /v1/models endpoints
+├── server/
+│   ├── mod.rs              # axum router + OpenAI handlers + ServerState re-exports
+│   ├── state.rs            # ServerState (registries, shortcut fields, adapters, engines)
+│   ├── handlers.rs         # HTTP handlers (chat, speech, transcriptions, rerank, embeddings)
+│   ├── dispatch.rs         # adapter_dispatch for /v1/messages
+│   └── error.rs            # API error -> HTTP response mapping
+```
+
+## Design notes
+
+- **Why single crate, not workspace?** Candle weights + tokenizers + (optionally) Metal/CUDA features compile together cleanly. Splitting into N crates would force every host to depend on every engine. Feature gates (`candle`, `cuda`, `metal`) keep the surface opt-in.
+- **Why `run_embedded()` only (no standalone binary)?** Any Rust host (Tauri 2 desktop shell, Flutter FFI bridge, server-side process, embedded controller, etc.) can host neure in-process, removing one inter-process hop and one more port to manage. The host owns the process lifecycle; neure doesn't need to be a separate daemon.
+
+neure supports three LLM engines: **candle** (default, Qwen2/3 + Llama2/3 + Phi-3 + Mistral + ChatGLM via `candle-transformers`), **litert** (opt-in, on-device .tflite via `litert_lm` bindings), and **mistralrs** (opt-in, 40+ model families with PagedAttention + ISQ via the mistral.rs engine). The split reflects different deployment targets: candle for development, litert for edge/mobile, mistralrs for unified multi-family coverage.
+
+## Three ML frameworks
+
+neure uses three ML frameworks: **candle** (for LLM, Rerank, ASR, Embedding), **burn** (for VoxCpm TTS), and **litert_lm** (for on-device LLM via Google LiteRT-LM). The candle/burn split is because VoxCpm is not in candle-transformers; vendoring the burn-based voxcpm_rs was the lowest-effort path to real TTS. litert_lm is a thin subprocess wrapper around Google's `lit` binary and is the only third-party framework without a Rust source fork — neure validates the model name against the `lit` registry's Gemma 3 set before calling `lit pull`.
+
+## References
+
+- [jhqxxx/aha](https://github.com/jhqxxx/aha) — Candle-based multimodal inference (LLM/VLM/ASR/TTS/OCR). Inspired the all-in-one design.
+- [EricLBuehler/candle-vllm](https://github.com/EricLBuehler/candle-vllm) — Candle-based LLM serving with OpenAI compat. Inspired the server + OpenAI wire format.
+- [huggingface/candle](https://github.com/huggingface/candle) — The ML framework neure is built on.
+- [sizzlecar/ferrum-infer-rs](https://github.com/sizzlecar/ferrum-infer-rs) — Candle workspace pattern + custom CUDA kernels inspiration.
+- [mixpeek/multimodal-inference-server](https://github.com/mixpeek/multimodal-inference-server) — Production VLM server reference.
+
+## License
+
+Apache-2.0. See [`LICENSE`](./LICENSE) for the full text and third-party attributions.
