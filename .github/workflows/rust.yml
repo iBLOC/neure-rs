@@ -1,0 +1,134 @@
+name: rust
+
+# Run the Rust test suite, clippy lint, and full-feature build on every
+# push to main and on PRs that touch Rust source. Three jobs:
+#   1. fmt+clippy:    fast static analysis (rustfmt + clippy deny warnings)
+#   2. test:          cargo test --lib with default features (matches local dev)
+#   3. all-features:  cargo build --all-features + cargo check --all-features --tests
+#                     (catches feature-flag interactions that default-feature
+#                     builds miss; runs in parallel with the above)
+#
+# The all-features job is the most expensive (~12-15 min cold) so it runs
+# in parallel with the cheaper fmt+clippy and test jobs. CI total wall time
+# is bounded by the slowest of the three.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/rust.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/rust.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: rust-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: short
+
+jobs:
+  fmt-clippy:
+    name: Format + Clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (with rustfmt + clippy)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry + build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target
+
+      - name: Show toolchain versions
+        run: |
+          rustc --version
+          cargo --version
+          cargo fmt --version
+          cargo clippy --version
+
+      - name: Check formatting (rustfmt)
+        run: cargo fmt --all -- --check
+
+      - name: Run clippy (deny warnings)
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+  test:
+    name: Unit tests (default features)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry + build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target
+
+      - name: Show toolchain versions
+        run: |
+          rustc --version
+          cargo --version
+
+      - name: Build library (default features)
+        run: cargo build --lib
+
+      - name: Build tests (default features)
+        run: cargo test --lib --no-run
+
+      - name: Run unit tests (default features)
+        run: cargo test --lib
+
+  all-features:
+    name: Full-feature build + test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry + build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target
+
+      - name: Show toolchain versions
+        run: |
+          rustc --version
+          cargo --version
+
+      - name: Build library (all features)
+        run: cargo build --all-features --lib
+
+      # `--tests` ensures unit-test binaries compile too. We don't run
+      # them with --all-features because most integration tests would
+      # require the full feature set up; the build-check is what
+      # catches feature-flag interactions.
+      - name: Build tests (all features)
+        run: cargo check --all-features --tests
+
+      - name: Run unit tests (all features)
+        run: cargo test --lib --all-features
