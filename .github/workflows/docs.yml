@@ -1,0 +1,145 @@
+name: docs
+
+# Build the VitePress documentation site on every push to main and on
+# every PR that touches docs/ or the workflow file itself. Optionally
+# deploys to GitHub Pages via workflow_dispatch.
+#
+# Two stages:
+#   1. build (every push + PR) — runs `npm run build`, uploads the static
+#      site as an artifact, reports link-check failures.
+#   2. deploy (workflow_dispatch only) — runs build then publishes to
+#      GitHub Pages. Requires repo settings: Settings → Pages → Source
+#      = GitHub Actions. Manual trigger via the Actions tab keeps
+#      deploys deliberate.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'docs/**'
+      - '.github/workflows/docs.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'docs/**'
+      - '.github/workflows/docs.yml'
+  workflow_dispatch:
+    inputs:
+      deploy:
+        description: 'Deploy to GitHub Pages after build'
+        type: boolean
+        default: false
+        required: false
+
+concurrency:
+  group: docs-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  build:
+    name: Build VitePress site
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      # VitePress respects these for the build output
+      NODE_ENV: production
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: 'docs/package-lock.json'
+
+      - name: Show environment
+        run: |
+          node --version
+          npm --version
+          echo "---"
+          echo "VitePress config:"
+          head -5 docs/.vitepress/config.ts
+
+      - name: Install dependencies
+        working-directory: docs
+        # Use `npm ci` if a lockfile is checked in; fall back to `npm install`
+        # on first build (when no lockfile yet exists).
+        run: |
+          if [ -f package-lock.json ]; then
+            echo "Using npm ci (lockfile present)"
+            npm ci --no-audit --no-fund
+          else
+            echo "No package-lock.json — using npm install (first build)"
+            npm install --no-audit --no-fund
+          fi
+
+      - name: Build VitePress site
+        working-directory: docs
+        run: |
+          set -euo pipefail
+          npx vitepress build \
+            --logLevel info
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: neure-docs-${{ github.sha }}
+          path: docs/.vitepress/dist
+          retention-days: 14
+          if-no-files-found: error
+          compression-level: 9
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "## VitePress build summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ -d docs/.vitepress/dist ]; then
+            echo "- **Output**: docs/.vitepress/dist/ ($(du -sh docs/.vitepress/dist | awk '{print $1}'))" >> $GITHUB_STEP_SUMMARY
+            echo "- **HTML pages**: $(find docs/.vitepress/dist -name '*.html' | wc -l)" >> $GITHUB_STEP_SUMMARY
+            echo "- **Asset count**: $(find docs/.vitepress/dist -type f | wc -l)" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "::warning::VitePress build output directory not found" >> $GITHUB_STEP_SUMMARY
+          fi
+
+  deploy:
+    name: Deploy to GitHub Pages
+    needs: build
+    if: github.event_name == 'workflow_dispatch' && inputs.deploy == true
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: neure-docs-${{ github.sha }}
+          path: docs/.vitepress/dist
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+        with:
+          artifact_name: neure-docs-${{ github.sha }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+          retention-days: 14
+
+      - name: Post-deploy summary
+        run: |
+          echo "## Deployment successful" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Page URL**: ${{ steps.deployment.outputs.page_url }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Commit**: ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Workflow run**: ${{ github.run_id }}" >> $GITHUB_STEP_SUMMARY
