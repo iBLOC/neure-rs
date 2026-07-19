@@ -239,7 +239,6 @@ struct DetectionHead {
     p3: HeadBranch,
     p4: HeadBranch,
     p5: HeadBranch,
-    num_classes: u32,
 }
 
 #[cfg(feature = "candle")]
@@ -249,7 +248,7 @@ impl DetectionHead {
         let p3 = HeadBranch::new(&vb.pp("p3"), 256, num_classes)?;
         let p4 = HeadBranch::new(&vb.pp("p4"), 512, num_classes)?;
         let p5 = HeadBranch::new(&vb.pp("p5"), 1024, num_classes)?;
-        Ok(Self { p3, p4, p5, num_classes })
+        Ok(Self { p3, p4, p5 })
     }
 
     /// Run the head on each scale. Returns 3 (cls, reg) tuples for P3, P4, P5.
@@ -269,8 +268,13 @@ impl DetectionHead {
 
 #[cfg(feature = "candle")]
 pub struct Yolov8Forward {
-    pub(crate) device: Device,
-    pub(crate) num_classes: u32,
+    /// Stored for future weight-loading + forward-pass plumbing; not
+    /// read in the v0 deterministic-detect path. Suppresses the
+    /// dead-code warning while keeping the field shape stable for
+    /// downstream consumers that may construct `Yolov8Forward` via
+    /// `new(device, num_classes)` and inspect it.
+    #[allow(dead_code)] pub(crate) device: Device,
+    #[allow(dead_code)] pub(crate) num_classes: u32,
     /// Owns the variables for the architecture. Stored separately so the
     /// same `Yolov8Forward` can be reused across requests after weight
     /// loading (e.g. via `load_weights`).
@@ -372,12 +376,11 @@ impl Yolov8Forward {
             // Stem and SPPF (YOLOv8n Sequential order)
             let stage = match model_num {
                 0 => "stem",
-                4 => "sppf",
-                5 => "sppf",
-                // C2f stages
                 1 => "stage1",
                 3 => "stage2",
-                5 if parts.len() == 1 => "stage3",  // but only if no .m.0 path
+                4 => "sppf",
+                5 if parts.len() == 1 => "stage3",  // C2f stage3; bare "5" otherwise → SPPF below
+                5 => "sppf",
                 7 => "stage4",
                 _ => return None,
             };
@@ -411,35 +414,6 @@ impl Yolov8Forward {
         all.extend(s4);
         all.extend(s5);
         Ok(all)
-    }
-
-    fn deterministic_detections(
-        &self, p3: &Tensor, p4: &Tensor, p5: &Tensor,
-    ) -> Vec<crate::vision::candle_yolo::RawDetection> {
-        let p3_h = p3.dim(2).unwrap_or(80);
-        let p3_w = p3.dim(3).unwrap_or(80);
-        let p4_h = p4.dim(2).unwrap_or(40);
-        let p4_w = p4.dim(3).unwrap_or(40);
-        let p5_h = p5.dim(2).unwrap_or(20);
-        let p5_w = p5.dim(3).unwrap_or(20);
-
-        vec![
-            crate::vision::candle_yolo::RawDetection {
-                class_id: 0, score: 0.85,
-                x: (p3_w as f32) * 8.0 / 2.0, y: (p3_h as f32) * 8.0 / 2.0,
-                w: 80.0, h: 160.0,
-            },
-            crate::vision::candle_yolo::RawDetection {
-                class_id: 2, score: 0.72,
-                x: (p4_w as f32) * 16.0 / 2.0, y: (p4_h as f32) * 16.0 / 2.0,
-                w: 120.0, h: 80.0,
-            },
-            crate::vision::candle_yolo::RawDetection {
-                class_id: 16, score: 0.68,
-                x: (p5_w as f32) * 32.0 / 2.0, y: (p5_h as f32) * 32.0 / 2.0,
-                w: 60.0, h: 60.0,
-            },
-        ]
     }
 }
 
@@ -544,7 +518,7 @@ fn dfl_decode(
     reg_dist: &Tensor,
     x: usize,
     y: usize,
-    w: usize,
+    #[allow(unused_variables)] w: usize,
     base_offset: usize,
 ) -> candle_core::Result<(f32, f32)> {
     // Extract 16 values at reg_dist[0, base_offset..base_offset+16, y, x]

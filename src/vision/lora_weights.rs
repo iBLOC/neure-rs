@@ -32,10 +32,7 @@
 
 use std::path::Path;
 
-use safetensors::SafeTensors;
-
 use crate::llm::NeureError;
-
 use super::lora::LoraTensor;
 
 /// Parse a LoRA safetensors file into `LoraTensor` entries.

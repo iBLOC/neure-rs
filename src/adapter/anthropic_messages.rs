@@ -465,10 +465,10 @@ impl ApiAdapter for AnthropicMessagesAdapter {
     }
 
     fn serialize_stream_event(&self, event: &CanonicalStreamEvent) -> ApiResult<Option<Bytes>> {
-        let CanonicalStreamEvent::Llm(llm_event) = event else {
-            return Ok(None);
-        };
-        let chunk_id = format!("msg_{}", uuid::Uuid::new_v4());
+        // `CanonicalStreamEvent` has only the `Llm` variant today, so this
+        // pattern is irrefutable (the `else` branch would be unreachable).
+        let CanonicalStreamEvent::Llm(llm_event) = event;
+        let _chunk_id = format!("msg_{}", uuid::Uuid::new_v4());
         let model_id = "".to_string();
         let anth_event = match llm_event {
             crate::canonical::CanonicalLlmStreamEvent::MessageStart { message } => {

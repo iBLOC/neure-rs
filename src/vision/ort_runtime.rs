@@ -278,7 +278,7 @@ impl OrtVisionRuntime {
         }
         let num_anchors = shape[2] as usize;
         let num_classes = num_classes as usize;
-        let row_size = 4 + num_classes;
+        let _row_size = 4 + num_classes;
 
         // For each anchor, find the class with the highest score
         let mut candidates: Vec<Candidate> = Vec::new();

@@ -52,8 +52,12 @@ struct LoadedVoxCpm {
     device: NdArrayDevice,
 }
 
+// Stub struct kept for source-level parity with the `voxcpm`-enabled
+// variant above; never instantiated. `#[allow(dead_code)]` silences
+// the field-naming-naming-warning when building default features only.
 #[cfg(not(feature = "voxcpm"))]
 #[derive(Clone)]
+#[allow(dead_code)]
 struct LoadedVoxCpm {
     sample_rate: u32,
 }

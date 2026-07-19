@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 
 use super::{
-    Detection, VisionImpl, VisionRequest, VisionResponse, VisionRuntime, VisionTask,
+    VisionImpl, VisionRequest, VisionResponse, VisionRuntime,
     RegisteredVision, VisionRegistryKey,
 };
 use crate::config::{DeviceSelection, NeureConfig, ResourceTracker};
@@ -167,6 +167,7 @@ impl VisionRuntime for UnavailableVisionRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vision::VisionTask;
 
     #[tokio::test]
     async fn test_runtime_for_unregistered_returns_error() {

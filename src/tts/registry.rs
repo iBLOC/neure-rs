@@ -67,25 +67,31 @@ impl TtsRuntimeRegistry {
             device: entry.device,
         };
 
-        let mut loaded = self.loaded.lock().await;
+        let loaded = self.loaded.lock().await;
         if let Some(rt) = loaded.get(&key) {
             return Ok(rt.clone());
         }
 
-        let rt: Arc<dyn TtsRuntime> = match entry.impl_id {
+        // Each match arm handles its own return path so the wildcard
+        // doesn't make the post-match code unreachable.
+        match entry.impl_id {
             #[cfg(feature = "voxcpm")]
             TtsImpl::Burn => {
-                let loaded = super::VoxCpmTtsRuntime::load(&entry.model_id, &entry.device)
+                let rt = super::VoxCpmTtsRuntime::load(&entry.model_id, &entry.device)
                     .await
                     .map_err(|e| {
                         NeureError::new(format!("VoxCpmTtsRuntime load failed: {e}"))
                     })?;
-                loaded
+                loaded.insert(key, rt.clone());
+                return Ok(rt);
             }
-        };
-
-        loaded.insert(key, rt.clone());
-        Ok(rt)
+            #[allow(unreachable_patterns)]
+            _ => {
+                return Err(NeureError::new(format!(
+                    "TTS implementation 'burn' requires building neure with --features voxcpm"
+                )));
+            }
+        }
     }
 
     pub fn list_registered(&self) -> Vec<String> {

@@ -1,13 +1,9 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use async_trait::async_trait;
 use tokio::sync::Mutex as AsyncMutex;
 
-use super::{
-    Chronos2Error, Chronos2Runtime, ForecastRequest, ForecastResponse, RegisteredChronos2,
-    StubChronos2Runtime,
-};
+use super::{Chronos2Runtime, RegisteredChronos2, StubChronos2Runtime};
 use crate::config::{DeviceSelection, ResourceTracker};
 use crate::llm::NeureError;
 
@@ -123,6 +119,7 @@ impl Default for Chronos2Registry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chronos2::{Chronos2Error, ForecastRequest};
 
     #[tokio::test]
     async fn runtime_for_returns_stub_for_unloaded_model() {

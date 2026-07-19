@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use futures_util::stream::{BoxStream, StreamExt};
+use futures_util::stream::BoxStream;
 use serde::{Deserialize, Serialize};
 
 use crate::config::DeviceSelection;

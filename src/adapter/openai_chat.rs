@@ -281,9 +281,9 @@ impl ApiAdapter for OpenAiChatAdapter {
     }
 
     fn serialize_stream_event(&self, event: &CanonicalStreamEvent) -> ApiResult<Option<Bytes>> {
-        let CanonicalStreamEvent::Llm(llm_event) = event else {
-            return Ok(None);
-        };
+        // `CanonicalStreamEvent` has only the `Llm` variant today, so this
+        // pattern is irrefutable (the `else` branch would be unreachable).
+        let CanonicalStreamEvent::Llm(llm_event) = event;
         let chunk_id = "chatcmpl-stream";
         let created = chrono::Utc::now().timestamp();
         let model_id = "";

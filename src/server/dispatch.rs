@@ -13,7 +13,7 @@ use futures_util::StreamExt;
 use std::sync::Arc;
 
 use crate::adapter::ApiAdapter;
-use crate::api_error::{ApiError, ApiResult};
+use crate::api_error::ApiError;
 use crate::canonical::{
     CanonicalRequest, CanonicalResponse, CanonicalStreamEvent,
 };

@@ -33,8 +33,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::config::{DeviceSelection, NeureConfig, ResourceTracker};
-use crate::llm::NeureError;
+use crate::config::{DeviceSelection, ResourceTracker};
 
 pub mod registry;
 pub use registry::Chronos2Registry;

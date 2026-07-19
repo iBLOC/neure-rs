@@ -30,7 +30,6 @@ pub use handlers::{
 pub use state::ServerState;
 
 use axum::{
-    extract::State,
     routing::{get, post},
     Router,
 };
