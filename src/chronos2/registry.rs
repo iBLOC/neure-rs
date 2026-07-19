@@ -72,24 +72,39 @@ impl Chronos2Registry {
         if let Some(rt) = g.get(model) {
             return rt.clone();
         }
-        let rt: Arc<dyn Chronos2Runtime> = if let Some(path) = crate::chronos2::env_discovery()
+        // The candle_runtime path is only available with `--features chronos2`.
+        // Default builds (without that feature) always fall back to the stub,
+        // which is the documented behavior for the stub-only `Sprint 3 first commit`.
+        #[cfg(feature = "chronos2")]
+        let real_path = crate::chronos2::env_discovery()
             .filter(|(id, _)| id == model)
-            .map(|(_, path)| path)
-        {
-            match tokio::task::spawn_blocking({
-                let p = path.clone();
-                move || crate::chronos2::candle_runtime::CandleChronos2Runtime::load(&p, crate::config::NeureConfig::default_device())
-            })
-            .await
+            .map(|(_, path)| path);
+        #[cfg(not(feature = "chronos2"))]
+        let real_path: Option<std::path::PathBuf> = None;
+
+        let rt: Arc<dyn Chronos2Runtime> = if let Some(path) = real_path {
+            #[cfg(feature = "chronos2")]
             {
-                Ok(Ok(rt)) => {
-                    tracing::info!(model = %model, path = %path.display(), "loaded Chronos2 model");
-                    Arc::new(rt) as Arc<dyn Chronos2Runtime>
+                match tokio::task::spawn_blocking({
+                    let p = path.clone();
+                    move || crate::chronos2::candle_runtime::CandleChronos2Runtime::load(&p, crate::config::NeureConfig::default_device())
+                })
+                .await
+                {
+                    Ok(Ok(rt)) => {
+                        tracing::info!(model = %model, path = %path.display(), "loaded Chronos2 model");
+                        Arc::new(rt) as Arc<dyn Chronos2Runtime>
+                    }
+                    _ => {
+                        tracing::warn!(model = %model, path = %path.display(), "failed to load Chronos2 model; falling back to stub");
+                        Arc::new(StubChronos2Runtime::new(model))
+                    }
                 }
-                _ => {
-                    tracing::warn!(model = %model, path = %path.display(), "failed to load Chronos2 model; falling back to stub");
-                    Arc::new(StubChronos2Runtime::new(model))
-                }
+            }
+            #[cfg(not(feature = "chronos2"))]
+            {
+                let _ = path;
+                Arc::new(StubChronos2Runtime::new(model))
             }
         } else {
             Arc::new(StubChronos2Runtime::new(model))

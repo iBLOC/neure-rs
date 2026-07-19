@@ -84,6 +84,14 @@ impl NeureConfig {
         PathBuf::from(home).join(".neure").join("models")
     }
 
+    /// Default candle device for inference. Returns CPU since
+    /// the chronos2 WIP path uses this and candle's CPU device
+    /// is always available; explicit CUDA / Metal selection
+    /// happens at runtime once the model is loaded.
+    pub fn default_device() -> candle_core::Device {
+        candle_core::Device::Cpu
+    }
+
     pub fn new() -> Self {
         Self {
             port: Self::default_port(),
